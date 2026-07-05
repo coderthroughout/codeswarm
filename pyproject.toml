@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codeswarm"
+version = "0.1.0"
+description = "A real, standalone multi-agent software-engineering swarm that emits verifiable trajectories."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Omium" }]
+# Core is stdlib-only on purpose: the whole system runs offline via MockClient.
+dependencies = []
+
+[project.optional-dependencies]
+# Real Claude runs need the anthropic SDK; tests need pytest.
+anthropic = ["anthropic>=0.40"]
+test = ["pytest>=7.0"]
+dev = ["anthropic>=0.40", "pytest>=7.0"]
+
+[project.scripts]
+codeswarm = "codeswarm.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["codeswarm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

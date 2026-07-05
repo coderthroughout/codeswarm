@@ -1,0 +1,70 @@
+# ---------------------------------------------------------------------------
+# codeswarm .gitignore
+# ---------------------------------------------------------------------------
+
+# Byte-compiled / optimized / C extensions
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Packaging / distribution / build
+build/
+dist/
+sdist/
+wheels/
+*.egg
+*.egg-info/
+.eggs/
+.installed.cfg
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Test / type / lint caches + coverage
+.pytest_cache/
+.tox/
+.nox/
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# Secrets / credentials / local config
+# (LLM API keys etc. — NEVER commit these)
+.env
+.env.*
+!.env.example
+*.env
+secrets.*
+*.key
+*.pem
+credentials.json
+
+# Generated run artifacts — the trajectory corpus codeswarm mints per run.
+# These are outputs, not source; regenerate with `python -m codeswarm batch`.
+runs/
+*.jsonl
+
+# Editor / IDE / OS cruft
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
