@@ -1,0 +1,48 @@
+# Omium Project Configuration
+# https://docs.omium.ai/configuration
+
+[project]
+name = "codeswarm"
+version = "0.1.0"
+
+[execution]
+# Cloud API URL (default)
+api_url = "https://api.omium.ai/api/v1"
+# Local development (uncomment for local testing)
+# api_url = "http://localhost:8000"
+
+[tracing]
+# Enable automatic tracing
+enabled = true
+# Trace ingestion endpoint (uses api_url by default)
+# endpoint = "https://api.omium.ai/api/v1/traces/ingest"
+
+[llm]
+# LLM provider: router, auto, digitalocean, openai
+provider = "router"
+# Default model
+model = "llama3.3-70b-instruct"
+
+[workflows]
+# Default workflow directory
+directory = "./workflows"
+
+# Define workflows inline
+# [[workflows.definitions]]
+# id = "my-workflow"
+# type = "crewai"
+# file = "workflows/my-workflow.json"
+
+[checkpoints]
+# Enable checkpointing
+enabled = true
+# Auto-checkpoint interval in seconds
+interval = 30
+# Maximum checkpoints to keep
+max_count = 100
+
+[logging]
+# Log level: debug, info, warning, error
+level = "info"
+# Enable rich formatting
+rich_output = true
