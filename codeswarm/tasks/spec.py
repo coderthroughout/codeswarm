@@ -27,6 +27,17 @@ class Task:
     reference_solution: dict[str, str] = field(default_factory=dict)  # MOCK-ONLY
     difficulty: str = "easy"
 
+    @classmethod
+    def from_prompt(cls, prompt: str, task_id: str = "task") -> "Task":
+        """Build a FREE-FORM task from a plain-language description.
+
+        No starter, no oracle, no reference solution — the spec agent writes the
+        acceptance tests (test_solution.py) at run time, and ``verify()`` runs
+        whatever tests then exist in the sandbox. This is the "real task from a
+        user" path, distinct from the canned builtin tasks.
+        """
+        return cls(id=task_id, prompt=prompt, difficulty="freeform")
+
     def verify(self, root: str | Path) -> Verdict:
         """Run the pytest oracle in ``root`` and return a Verdict.
 

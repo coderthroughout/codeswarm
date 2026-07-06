@@ -3,6 +3,8 @@ final Trajectory. No wall clock anywhere.
 """
 from __future__ import annotations
 
+from typing import Callable
+
 from codeswarm.trace.types import (
     Event,
     Trajectory,
@@ -16,13 +18,23 @@ class TrajectoryRecorder:
 
     ``ts_index`` is a monotonic counter, incremented per appended event, so the
     trajectory is deterministic and replayable regardless of timing.
+
+    ``on_event`` is an optional live callback fired for each appended event — used
+    by the web UI to stream the swarm's progress in real time. It must never raise
+    into the recorder (errors are swallowed) so telemetry can't break a run.
     """
 
-    def __init__(self, task_id: str, run_id: str) -> None:
+    def __init__(
+        self,
+        task_id: str,
+        run_id: str,
+        on_event: Callable[[Event], None] | None = None,
+    ) -> None:
         self.task_id = task_id
         self.run_id = run_id
         self.events: list[Event] = []
         self._ts_index = 0
+        self._on_event = on_event
 
     def append_event(
         self,
@@ -41,6 +53,11 @@ class TrajectoryRecorder:
         )
         self._ts_index += 1
         self.events.append(event)
+        if self._on_event is not None:
+            try:
+                self._on_event(event)
+            except Exception:  # noqa: BLE001 - live callback must not break a run
+                pass
         return event
 
     def build(self, verdict: Verdict | None) -> Trajectory:

@@ -29,17 +29,28 @@ class WorkflowEngine:
         planner,
         executor: Executor,
         tools_factory: Callable[[Workspace], dict] | None = None,
+        spec_agent=None,
     ) -> None:
         self.config = config
         self.llm = llm
         self.planner = planner
         self.executor = executor
         self.tools_factory = tools_factory or default_tools
+        # Writes the pytest oracle for FREE-FORM tasks (those with no test_files).
+        if spec_agent is None:
+            from codeswarm.agents.spec import SpecAgent
 
-    async def run(self, task, *, run_id: str | None = None) -> Trajectory:
-        """Run one task end-to-end and return its Trajectory."""
+            spec_agent = SpecAgent()
+        self.spec_agent = spec_agent
+
+    async def run(self, task, *, run_id: str | None = None, on_event=None) -> Trajectory:
+        """Run one task end-to-end and return its Trajectory.
+
+        ``on_event`` is an optional live callback (event -> None) fired as each
+        event is recorded — used by the web UI to stream progress.
+        """
         run_id = run_id or f"{task.id}-{uuid.uuid4().hex[:8]}"
-        recorder = TrajectoryRecorder(task_id=task.id, run_id=run_id)
+        recorder = TrajectoryRecorder(task_id=task.id, run_id=run_id, on_event=on_event)
         state = WorkflowState(task_id=task.id, task=task)
 
         with Workspace() as workspace:
@@ -57,6 +68,10 @@ class WorkflowEngine:
                 recorder=recorder,
                 task=task,
             )
+
+            # 0) Free-form task with no oracle: the spec agent writes the tests.
+            if not getattr(task, "test_files", None):
+                await self.spec_agent.run(ctx)
 
             # 1) Plan.
             plan_action = await self.planner.run(ctx)
