@@ -32,6 +32,18 @@ def _slug(text: str) -> str:
     return ("-".join(re.findall(r"[a-z0-9]+", text.lower())[:5]) or "task")[:40]
 
 
+def _persist(config, traj) -> None:
+    """Save the trajectory to runs/<run_id>.jsonl (the web path did not before)."""
+    from pathlib import Path
+
+    try:
+        d = Path(config.runs_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{traj.run_id}.jsonl").write_text(traj.to_jsonl(), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _summarize(ev) -> str:
     """One human-readable line for a trajectory event."""
     k, ag, p = ev.kind, ev.agent, ev.payload
@@ -101,6 +113,17 @@ async def _run_stream(prompt: str, task_id: str | None):
         tools_factory=tools_factory,
     )
 
+    # Stream the run into Omium too (execution + checkpoints + traces) so it shows
+    # in the dashboard — the SAME seam the CLI's --omium uses. Fail-soft: if Omium
+    # isn't configured, OmiumRun no-ops and the local run is unaffected.
+    import uuid as _uuid
+
+    from codeswarm.workflow.omium_executor import OmiumExecutor, OmiumRun
+
+    run_id = f"{task.id}-{_uuid.uuid4().hex[:8]}"
+    omium_run = OmiumRun(config).start(task, run_id)
+    engine.executor = OmiumExecutor(engine.executor, omium_run)
+
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
 
@@ -109,7 +132,9 @@ async def _run_stream(prompt: str, task_id: str | None):
 
     async def runner():
         try:
-            traj = await engine.run(task, on_event=on_event)
+            traj = await engine.run(task, run_id=run_id, on_event=on_event)
+            _persist(config, traj)
+            omium_run.finish(traj.verdict)
             queue.put_nowait(("done", traj))
         except Exception as e:  # noqa: BLE001
             queue.put_nowait(("error", repr(e)))
@@ -130,6 +155,7 @@ async def _run_stream(prompt: str, task_id: str | None):
                 "signals": (v.signals if v else {}),
                 "run_id": payload.run_id,
                 "failure_signature": payload.failure_signature,
+                "omium_url": omium_run.dashboard_url,
                 "files": captured,
             })}
             break
@@ -206,6 +232,7 @@ go.onclick=()=>{
     const d=JSON.parse(e.data);
     const pill=d.passed?'<span class="pill pass">PASS</span>':'<span class="pill fail">FAIL</span>';
     let html=pill+' <span class="muted">'+JSON.stringify(d.signals)+' · run '+d.run_id+'</span>';
+    if(d.omium_url){html+=' <a href="'+d.omium_url+'" target="_blank" style="color:#58a6ff">↗ view in Omium</a>';}
     for(const [path,content] of Object.entries(d.files||{})){
       html+='<h3>'+path+'</h3><pre>'+content.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))+'</pre>';
     }

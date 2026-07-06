@@ -143,6 +143,14 @@ class OmiumRun:
     def finish(self, verdict) -> None:
         if not (self.execution_id and self._base):
             return
+        # The staging execution-engine's PATCH /executions/{id}/status currently
+        # 500s (a server-side UUID->str bug; fix on main, not yet deployed) and
+        # fires a Slack alert on every call. Skip the status update until that
+        # deploys — the execution + checkpoints + traces still land; only the
+        # final status label is deferred. Set CODESWARM_OMIUM_SET_STATUS=1 to
+        # re-enable once the server fix is live.
+        if os.environ.get("CODESWARM_OMIUM_SET_STATUS", "").lower() not in ("1", "true", "yes"):
+            return
         try:
             import httpx
 
