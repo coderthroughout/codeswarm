@@ -135,11 +135,19 @@ class AnthropicClient:
         self._anthropic = anthropic
         self.model = config.model
         self.max_tokens = 8000
-        # A bare client resolves credentials from the environment (API key or
-        # `ant auth login` profile). Passing api_key=None lets the SDK do that.
-        if config.api_key:
+        provider = getattr(config, "llm_provider", "anthropic")
+        if provider == "vertex":
+            # Claude on GCP Vertex AI. Auth via Application Default Credentials
+            # (gcloud ADC / a service account) — no API key. Same messages + tool
+            # API as the direct client, so complete() below is unchanged.
+            self._client = anthropic.AnthropicVertex(
+                project_id=config.vertex_project,
+                region=config.vertex_region,
+            )
+        elif config.api_key:
             self._client = anthropic.Anthropic(api_key=config.api_key)
         else:
+            # A bare client resolves credentials from the environment.
             self._client = anthropic.Anthropic()
 
     async def complete(
