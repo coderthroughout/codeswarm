@@ -98,20 +98,38 @@ def _print_result(result: TaskResult, out_path: Path) -> None:
     )
 
 
+def _slug(text: str) -> str:
+    """A short, filesystem-safe id derived from a free-form prompt."""
+    import re
+
+    words = re.findall(r"[a-z0-9]+", text.lower())[:5]
+    return ("-".join(words) or "task")[:40]
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     config = Config.from_env(
         model=args.model,
         runs_dir=args.runs_dir,
         max_retries=args.max_retries,
+        llm_provider=args.provider,
         omium_enabled=(True if args.omium else None),
     )
-    try:
-        task = get_task(args.task)
-    except KeyError:
-        print(
-            f"unknown task {args.task!r}. available: {', '.join(list_tasks())}",
-            file=sys.stderr,
-        )
+    if args.prompt:
+        if args.mock:
+            print("--prompt (free-form) needs a real LLM; drop --mock.", file=sys.stderr)
+            return 2
+        task = Task.from_prompt(args.prompt, task_id=_slug(args.prompt))
+    elif args.task:
+        try:
+            task = get_task(args.task)
+        except KeyError:
+            print(
+                f"unknown task {args.task!r}. available: {', '.join(list_tasks())}",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        print("provide --task <id> or --prompt \"<description>\".", file=sys.stderr)
         return 2
 
     result = asyncio.run(_run_one(config, task, use_mock=args.mock))
@@ -120,11 +138,19 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0 if result.passed else 1
 
 
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from codeswarm.web.app import serve
+
+    serve(host=args.host, port=args.port)
+    return 0
+
+
 def _cmd_batch(args: argparse.Namespace) -> int:
     config = Config.from_env(
         model=args.model,
         runs_dir=args.runs_dir,
         max_retries=args.max_retries,
+        llm_provider=args.provider,
         omium_enabled=(True if args.omium else None),
     )
     if args.tasks == "all":
@@ -162,6 +188,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--model", default=None, help="Model id (real runs only).")
+    common.add_argument(
+        "--provider",
+        default=None,
+        choices=["anthropic", "vertex"],
+        help="Real LLM provider: anthropic (API key) or vertex (Claude on GCP).",
+    )
     common.add_argument("--mock", action="store_true", help="Use the offline MockClient.")
     common.add_argument("--runs-dir", default=None, help="Where to write trajectories.")
     common.add_argument("--max-retries", type=int, default=None, help="Attempts per step.")
@@ -171,8 +203,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stream this run into Omium (execution + traces + checkpoints).",
     )
 
-    p_run = sub.add_parser("run", parents=[common], help="Run one task.")
-    p_run.add_argument("--task", required=True, help="Builtin task id.")
+    p_run = sub.add_parser("run", parents=[common], help="Run one task (builtin id or free-form prompt).")
+    p_run.add_argument("--task", default=None, help="Builtin task id.")
+    p_run.add_argument("--prompt", default=None, help="Free-form task in plain language (the real path).")
     p_run.set_defaults(func=_cmd_run)
 
     p_batch = sub.add_parser("batch", parents=[common], help="Run many tasks (data-gen).")
@@ -182,6 +215,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_tasks = sub.add_parser("tasks", help="List builtin tasks.")
     p_tasks.set_defaults(func=_cmd_tasks)
+
+    p_serve = sub.add_parser("serve", parents=[common], help="Launch the web UI.")
+    p_serve.add_argument("--host", default="127.0.0.1", help="Bind host.")
+    p_serve.add_argument("--port", type=int, default=8787, help="Bind port.")
+    p_serve.set_defaults(func=_cmd_serve)
 
     return parser
 
