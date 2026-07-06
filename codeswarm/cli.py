@@ -59,7 +59,26 @@ def _write_trajectory(config: Config, trajectory: Trajectory) -> Path:
 
 async def _run_one(config: Config, task: Task, use_mock: bool) -> TaskResult:
     engine = _build_engine(config, task, use_mock)
-    trajectory = await engine.run(task)
+
+    from codeswarm.workflow.omium_executor import omium_enabled
+
+    omium_run = None
+    if omium_enabled(config):
+        # Correlate the local run and the Omium execution under one run_id.
+        import uuid
+
+        from codeswarm.workflow.omium_executor import OmiumExecutor, OmiumRun
+
+        run_id = f"{task.id}-{uuid.uuid4().hex[:8]}"
+        omium_run = OmiumRun(config).start(task, run_id)
+        engine.executor = OmiumExecutor(engine.executor, omium_run)
+        trajectory = await engine.run(task, run_id=run_id)
+        omium_run.finish(trajectory.verdict)
+        if omium_run.dashboard_url:
+            print(f"  omium: {omium_run.dashboard_url}")
+    else:
+        trajectory = await engine.run(task)
+
     return TaskResult(
         task_id=task.id,
         run_id=trajectory.run_id,
@@ -84,6 +103,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         model=args.model,
         runs_dir=args.runs_dir,
         max_retries=args.max_retries,
+        omium_enabled=(True if args.omium else None),
     )
     try:
         task = get_task(args.task)
@@ -105,6 +125,7 @@ def _cmd_batch(args: argparse.Namespace) -> int:
         model=args.model,
         runs_dir=args.runs_dir,
         max_retries=args.max_retries,
+        omium_enabled=(True if args.omium else None),
     )
     if args.tasks == "all":
         selected = list_tasks()
@@ -144,6 +165,11 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--mock", action="store_true", help="Use the offline MockClient.")
     common.add_argument("--runs-dir", default=None, help="Where to write trajectories.")
     common.add_argument("--max-retries", type=int, default=None, help="Attempts per step.")
+    common.add_argument(
+        "--omium",
+        action="store_true",
+        help="Stream this run into Omium (execution + traces + checkpoints).",
+    )
 
     p_run = sub.add_parser("run", parents=[common], help="Run one task.")
     p_run.add_argument("--task", required=True, help="Builtin task id.")

@@ -24,6 +24,11 @@ class Config:
     max_retries: int = 3      # attempts per step (code -> test -> review loop)
     runs_dir: str = "runs"    # where CLI writes <run_id>.jsonl trajectories
 
+    # Optional Omium integration (observability + recovery substrate). Off by
+    # default; the standalone run never touches Omium. See workflow/omium_executor.py.
+    omium_enabled: bool = False
+    omium_workflow_id: str | None = None
+
     @classmethod
     def from_env(cls, **overrides: object) -> "Config":
         """Build a Config from environment variables, applying explicit overrides.
@@ -34,6 +39,7 @@ class Config:
           - CODESWARM_MAX_ITERATIONS
           - CODESWARM_MAX_RETRIES
           - CODESWARM_RUNS_DIR
+          - CODESWARM_OMIUM (enable) / CODESWARM_OMIUM_WORKFLOW_ID
         """
         api_key = os.environ.get("CODESWARM_API_KEY") or os.environ.get(
             "ANTHROPIC_API_KEY"
@@ -44,6 +50,9 @@ class Config:
             max_iterations=int(os.environ.get("CODESWARM_MAX_ITERATIONS", "10")),
             max_retries=int(os.environ.get("CODESWARM_MAX_RETRIES", "3")),
             runs_dir=os.environ.get("CODESWARM_RUNS_DIR", "runs"),
+            omium_enabled=os.environ.get("CODESWARM_OMIUM", "").lower()
+            in ("1", "true", "yes"),
+            omium_workflow_id=os.environ.get("CODESWARM_OMIUM_WORKFLOW_ID"),
         )
         for key, value in overrides.items():
             if value is not None and hasattr(cfg, key):
