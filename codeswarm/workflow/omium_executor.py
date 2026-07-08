@@ -33,11 +33,35 @@ _PROJECT = "codeswarm"
 _AGENT_ID = str(uuid.uuid5(uuid.NAMESPACE_DNS, "codeswarm.omium.agent"))
 
 
+def _mode(config=None) -> str:
+    """Resolve the active Omium mode ("off" | "observability" | "corpus").
+
+    Config wins; otherwise fall back to the CODESWARM_OMIUM_MODE env var, then the
+    legacy CODESWARM_OMIUM=1 (== observability). Keeps every entrypoint (CLI, web,
+    library) consistent without importing Config here.
+    """
+    if config is not None:
+        m = str(getattr(config, "omium_mode", "") or "").strip().lower()
+        if m in ("off", "observability", "corpus"):
+            return m
+        if getattr(config, "omium_enabled", False):
+            return "observability"
+    m = (os.environ.get("CODESWARM_OMIUM_MODE") or "").strip().lower()
+    if m in ("off", "observability", "corpus"):
+        return m
+    if os.environ.get("CODESWARM_OMIUM", "").lower() in ("1", "true", "yes"):
+        return "observability"
+    return "off"
+
+
 def omium_enabled(config=None) -> bool:
-    """True when the Omium integration should activate (CLI flag or env)."""
-    if config is not None and getattr(config, "omium_enabled", False):
-        return True
-    return os.environ.get("CODESWARM_OMIUM", "").lower() in ("1", "true", "yes")
+    """True when the OBSERVABILITY integration (Mode-1) should activate."""
+    return _mode(config) == "observability"
+
+
+def corpus_mode_enabled(config=None) -> bool:
+    """True when the CORPUS integration (Mode-2) should activate."""
+    return _mode(config) == "corpus"
 
 
 class OmiumRun:
@@ -143,13 +167,11 @@ class OmiumRun:
     def finish(self, verdict) -> None:
         if not (self.execution_id and self._base):
             return
-        # The staging execution-engine's PATCH /executions/{id}/status currently
-        # 500s (a server-side UUID->str bug; fix on main, not yet deployed) and
-        # fires a Slack alert on every call. Skip the status update until that
-        # deploys — the execution + checkpoints + traces still land; only the
-        # final status label is deferred. Set CODESWARM_OMIUM_SET_STATUS=1 to
-        # re-enable once the server fix is live.
-        if os.environ.get("CODESWARM_OMIUM_SET_STATUS", "").lower() not in ("1", "true", "yes"):
+        # Status finalize is ON by default (the server-side UUID->str 500 was
+        # fixed + deployed 2026-07-06, fleet @66508dd). CODESWARM_OMIUM_SET_STATUS=0
+        # remains as a kill-switch if the endpoint ever regresses (it used to fire
+        # a Slack alert per call).
+        if os.environ.get("CODESWARM_OMIUM_SET_STATUS", "1").lower() in ("0", "false", "no"):
             return
         try:
             import httpx
@@ -214,3 +236,266 @@ class OmiumExecutor:
         except Exception:  # noqa: BLE001
             traced = _delegate
         return await traced()
+
+
+# ===========================================================================
+# Mode-2: CORPUS. Drive the execution-engine so each FAILING codeswarm task
+# becomes a genuine ``omium.execution.failed`` carrying codeswarm's REAL failure
+# signature, so the recovery-orchestrator mints a failures + recovery_attempt row
+# keyed on that signature (diverse per task family). See DESIGN / the report.
+#
+# HOW IT WORKS (the seam, verified read-only against the platform):
+#   * The execution-engine already RUNS an inline langgraph ``workflow_definition``
+#     passed in ``metadata`` on POST /executions (public API, X-API-Key). A node
+#     carrying ``force_error`` raises RuntimeError(message) — the SAME internal seam
+#     scripts/stress/recovery_load.py uses to drive REAL failures.
+#   * On the terminal-failure path EE calls ``_publish_execution_failed`` which emits
+#     ``omium.execution.failed`` with ``failure_signature_hash = sha256(error_type |
+#     NORMALIZE_v1(error.message) | failing_node)``. Because we put codeswarm's real
+#     ``signature_token`` (exception kinds x failing test files) into the force_error
+#     message, EE's signature is a DETERMINISTIC function of codeswarm's real failure
+#     — honest and diverse (14+ task families -> many signature clusters).
+#   * The recovery consumer INSERTs a ``failures`` row + ``recovery_attempt`` row for
+#     any valid event (needs tenant_id + execution_id + signature — all present).
+#
+# HONESTY: the signature is derived ONLY from codeswarm's real task failure; we never
+# fabricate a signal. If a run PASSES there is nothing to mint (returns None). We do
+# NOT inject synthetic transient/429/schema tokens to trip the migrated-class router.
+# The platform recognizes the "failed its pytest oracle" marker as the migrated
+# LOW-risk class ``code_test_failure`` (twin routers + MIGRATED_CLASSES), and the
+# seeded pinned workflow (seed_codeswarm_corpus_workflow.sql) makes the authoritative
+# re-run reproduce the failure -> verified_failure -> a WORM reward row is minted.
+# ===========================================================================
+
+import re as _re
+
+
+def extract_dominant_failure(trajectory) -> dict | None:
+    """Return the dominant (first) ``failure`` event payload from a Trajectory, or None.
+
+    None means the run had no recorded failure (it passed / never failed) — there is
+    nothing honest to mint. The returned dict carries codeswarm's real, stable failure
+    signal: ``signature_token`` (kinds x failing files), ``error_type``, ``error_kinds``,
+    ``failing_tests``, ``summary``.
+    """
+    events = getattr(trajectory, "events", None) or []
+    for ev in events:
+        if getattr(ev, "kind", None) == "failure":
+            payload = dict(getattr(ev, "payload", {}) or {})
+            payload.setdefault("step_id", getattr(ev, "step_id", None))
+            return payload
+    return None
+
+
+# The CONSTANT failing-node name, shared with the platform's seeded codeswarm workflow
+# (Omium-platform/scripts/seed_codeswarm_corpus_workflow.sql, workflow id
+# 8b628198-fd99-53ce-898d-2b53c647374d version 1). RERUNNING fetches THAT pinned def
+# from workflow-manager — NOT this inline def — so the failing node must be the SAME
+# name on both sides or checkpoint replay can't reproduce at the right node. The WHERE
+# signal (failing test files) still reaches the signature via the MESSAGE: the
+# signature_token (kinds x files) is embedded there and NORMALIZE_v1 preserves words.
+CORPUS_NODE_NAME = "cs_oracle"
+
+
+def _sanitize_node_name(failure: dict, task_id: str) -> str:
+    """The constant seeded failing-node name (see CORPUS_NODE_NAME above).
+
+    Signature diversity is carried ENTIRELY by the force_error message (which embeds
+    codeswarm's real signature_token); the node axis is pinned so the seeded pinned
+    workflow version can reproduce the failure on the authoritative re-run.
+    """
+    return CORPUS_NODE_NAME
+
+
+def build_corpus_failure_message(failure: dict, task_id: str) -> str:
+    """The honest force_error message embedding codeswarm's REAL failure identity.
+
+    EE hashes NORMALIZE_v1(message) into the signature, so this string IS the diversity
+    lever — it must derive from the real failure and differ per failure family. We lead
+    with the stable ``signature_token`` (kinds x failing files) which codeswarm already
+    computes to be "stable AND discriminating".
+    """
+    token = (
+        failure.get("signature_token")
+        or failure.get("error_type")
+        or failure.get("summary")
+        or "unknown"
+    )
+    kinds = failure.get("error_kinds") or []
+    kinds_str = "+".join(str(k) for k in kinds) if kinds else str(
+        failure.get("error_type") or "test_failure"
+    )
+    return (
+        f"codeswarm task {task_id} failed its pytest oracle "
+        f"[{kinds_str}]: {token}"
+    )
+
+
+def build_corpus_workflow_definition(node_name: str, message: str) -> dict:
+    """Inline langgraph def whose middle node PERMANENTLY force_errors ``message``.
+
+    Mirrors the proven scripts/stress/recovery_load.py RED shape (ingest -> fail ->
+    summarize). ``force_error`` makes EE's node raise RuntimeError(message) so the real
+    terminal-failure path (and _publish_execution_failed) fires.
+    """
+    return {
+        "name": f"codeswarm-corpus-{node_name}",
+        "nodes": [
+            {"name": "ingest", "function": "ingest_node"},
+            {"name": node_name, "function": "process_node", "force_error": message},
+            {"name": "summarize", "function": "summarize_node"},
+        ],
+        "edges": [
+            {"from": "START", "to": "ingest"},
+            {"from": "ingest", "to": node_name},
+            {"from": node_name, "to": "summarize"},
+            {"from": "summarize", "to": "END"},
+        ],
+    }
+
+
+def build_corpus_execution_body(
+    task,
+    run_id: str,
+    workflow_id: str,
+    workflow_definition: dict,
+    failure: dict,
+) -> dict:
+    """The POST /executions body that drives EE to a codeswarm-derived failure."""
+    return {
+        "workflow_id": workflow_id,
+        "agent_id": f"codeswarm-{task.id}",
+        "input_data": {"task": task.id, "run_id": run_id},
+        "metadata": {
+            "workflow_type": "langgraph",
+            "workflow_definition": workflow_definition,
+            # workflow_version rides onto the published event -> failures.workflow_version.
+            # A real (>0) value is required for the RERUNNING re-run to pin a version once a
+            # matching workflow is seeded in workflow-manager (else it escalates
+            # read_model_miss). Forward-compatible default; 0 is fine for failures-only corpus.
+            "workflow_version": 1,
+            "source": "codeswarm-corpus",
+            "task_id": task.id,
+            "run_id": run_id,
+            "difficulty": getattr(task, "difficulty", ""),
+            # Carry codeswarm's real failure identity for downstream correlation.
+            "codeswarm_signature_token": failure.get("signature_token"),
+            "codeswarm_error_kinds": failure.get("error_kinds") or [],
+            "codeswarm_failing_tests": failure.get("failing_tests") or [],
+        },
+    }
+
+
+def _default_workflow_id() -> str:
+    """A stable, valid UUID for codeswarm's corpus workflow.
+
+    executions.workflow_id is a free-text VARCHAR (no FK), but the API model coerces it
+    to a UUID, so it MUST be a valid UUID string. A configured/resolved id is preferred;
+    this deterministic uuid5 is the fail-safe default so the anchor POST always validates.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, "codeswarm.omium.corpus.workflow"))
+
+
+class OmiumCorpusRun:
+    """Per-run Mode-2 context: turn a failing codeswarm task into real recovery corpus.
+
+    Best-effort + fail-soft (an Omium outage never fails the local run). Constructed
+    per run; ``mint`` is a no-op that returns None when the run passed or Omium is
+    unreachable. ``api_base``/``api_key``/``workflow_id`` may be injected (tests, or an
+    env-only deployment) to bypass the omium SDK entirely.
+    """
+
+    def __init__(
+        self,
+        config,
+        *,
+        api_base: str | None = None,
+        api_key: str | None = None,
+        workflow_id: str | None = None,
+    ) -> None:
+        self.config = config
+        self._base = api_base
+        self._key = api_key
+        self._workflow_id = workflow_id
+        self.execution_id: str | None = None
+
+    # -- config resolution -------------------------------------------------
+    def _resolve_config(self) -> bool:
+        """Populate base URL + API key. Prefer injected/env values, then the omium SDK.
+
+        Returns True when both a base and a key are known. Fail-soft: never raises.
+        """
+        if not self._base or not self._key:
+            env_base = os.environ.get("OMIUM_API_URL")
+            env_key = os.environ.get("OMIUM_API_KEY")
+            if env_base and env_key:
+                # Normalise to include the /api/v1 suffix the executions route lives under.
+                base = env_base.rstrip("/")
+                if not base.endswith("/api/v1"):
+                    base = base + "/api/v1"
+                self._base = self._base or base
+                self._key = self._key or env_key
+        if not self._base or not self._key:
+            try:
+                import omium
+
+                omium.init(project=_PROJECT)  # reads OMIUM_API_URL/KEY + ~/.omium
+                cfg = omium.get_current_config()
+                self._base = self._base or cfg.api_base_url  # includes /api/v1
+                self._key = self._key or cfg.api_key
+            except Exception as e:  # noqa: BLE001 — omium optional; fail-soft
+                log.warning("omium corpus: SDK config unavailable: %s", e)
+        return bool(self._base and self._key)
+
+    def _resolve_workflow_id(self) -> str:
+        if self._workflow_id:
+            return self._workflow_id
+        wf = getattr(self.config, "omium_workflow_id", None) or os.environ.get(
+            "CODESWARM_OMIUM_WORKFLOW_ID"
+        )
+        return wf or _default_workflow_id()
+
+    # -- minting -----------------------------------------------------------
+    def mint(self, task, run_id: str, trajectory) -> str | None:
+        """Drive EE to emit omium.execution.failed for a FAILED codeswarm run.
+
+        Returns the created execution_id, or None when the run passed (nothing to mint)
+        or Omium is unreachable. Never raises into the caller.
+        """
+        failure = extract_dominant_failure(trajectory)
+        if failure is None:
+            log.info("omium corpus: run %s passed (no failure) — nothing to mint", run_id)
+            return None
+        if not self._resolve_config():
+            log.warning("omium corpus: no API base/key — skipping mint for %s", run_id)
+            return None
+
+        workflow_id = self._resolve_workflow_id()
+        node_name = _sanitize_node_name(failure, task.id)
+        message = build_corpus_failure_message(failure, task.id)
+        wf_def = build_corpus_workflow_definition(node_name, message)
+        body = build_corpus_execution_body(task, run_id, workflow_id, wf_def, failure)
+
+        try:
+            import httpx
+
+            r = httpx.post(
+                f"{self._base}/executions",
+                headers={"X-API-Key": self._key, "Content-Type": "application/json"},
+                json=body,
+                timeout=30,
+            )
+            if r.status_code in (200, 201):
+                self.execution_id = r.json().get("id")
+                log.info(
+                    "omium corpus: minted failing execution %s (task=%s sig_token=%s)",
+                    self.execution_id, task.id, failure.get("signature_token"),
+                )
+                return self.execution_id
+            log.warning(
+                "omium corpus: POST /executions failed HTTP %s %s",
+                r.status_code, r.text[:200],
+            )
+        except Exception as e:  # noqa: BLE001 — fail-soft
+            log.warning("omium corpus: mint failed (continuing local run): %s", e)
+        return None

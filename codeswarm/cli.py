@@ -60,11 +60,12 @@ def _write_trajectory(config: Config, trajectory: Trajectory) -> Path:
 async def _run_one(config: Config, task: Task, use_mock: bool) -> TaskResult:
     engine = _build_engine(config, task, use_mock)
 
-    from codeswarm.workflow.omium_executor import omium_enabled
+    from codeswarm.workflow.omium_executor import corpus_mode_enabled, omium_enabled
 
     omium_run = None
     if omium_enabled(config):
-        # Correlate the local run and the Omium execution under one run_id.
+        # Mode-1 (observability): correlate the local run and the Omium execution
+        # under one run_id; per-step spans + checkpoints; finalize status.
         import uuid
 
         from codeswarm.workflow.omium_executor import OmiumExecutor, OmiumRun
@@ -76,6 +77,19 @@ async def _run_one(config: Config, task: Task, use_mock: bool) -> TaskResult:
         omium_run.finish(trajectory.verdict)
         if omium_run.dashboard_url:
             print(f"  omium: {omium_run.dashboard_url}")
+    elif corpus_mode_enabled(config):
+        # Mode-2 (corpus): run locally as usual, then drive the execution-engine so a
+        # FAILING task mints a real omium.execution.failed carrying codeswarm's
+        # signature. The local run/trajectory is unchanged.
+        import uuid
+
+        from codeswarm.workflow.omium_executor import OmiumCorpusRun
+
+        run_id = f"{task.id}-{uuid.uuid4().hex[:8]}"
+        trajectory = await engine.run(task, run_id=run_id)
+        execution_id = OmiumCorpusRun(config).mint(task, run_id, trajectory)
+        if execution_id:
+            print(f"  omium corpus: minted failing execution {execution_id}")
     else:
         trajectory = await engine.run(task)
 
@@ -106,13 +120,22 @@ def _slug(text: str) -> str:
     return ("-".join(words) or "task")[:40]
 
 
+def _resolve_omium_mode(args: argparse.Namespace) -> str | None:
+    """--omium-mode wins; else legacy --omium maps to observability; else unset."""
+    if args.omium_mode:
+        return args.omium_mode
+    if args.omium:
+        return "observability"
+    return None
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     config = Config.from_env(
         model=args.model,
         runs_dir=args.runs_dir,
         max_retries=args.max_retries,
         llm_provider=args.provider,
-        omium_enabled=(True if args.omium else None),
+        omium_mode=_resolve_omium_mode(args),
     )
     if args.prompt:
         if args.mock:
@@ -151,7 +174,7 @@ def _cmd_batch(args: argparse.Namespace) -> int:
         runs_dir=args.runs_dir,
         max_retries=args.max_retries,
         llm_provider=args.provider,
-        omium_enabled=(True if args.omium else None),
+        omium_mode=_resolve_omium_mode(args),
     )
     if args.tasks == "all":
         selected = list_tasks()
@@ -200,7 +223,17 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument(
         "--omium",
         action="store_true",
-        help="Stream this run into Omium (execution + traces + checkpoints).",
+        help="Mode-1: stream this run into Omium (execution + traces + checkpoints).",
+    )
+    common.add_argument(
+        "--omium-mode",
+        default=None,
+        choices=["off", "observability", "corpus"],
+        help=(
+            "Omium integration mode (overrides --omium). "
+            "'corpus' drives the execution-engine so a FAILING run mints real "
+            "recovery-training corpus (omium.execution.failed)."
+        ),
     )
 
     p_run = sub.add_parser("run", parents=[common], help="Run one task (builtin id or free-form prompt).")
