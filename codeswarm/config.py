@@ -35,7 +35,18 @@ class Config:
 
     # Optional Omium integration (observability + recovery substrate). Off by
     # default; the standalone run never touches Omium. See workflow/omium_executor.py.
+    #
+    # omium_mode selects WHAT the integration does:
+    #   "off"           — no Omium (default).
+    #   "observability" — Mode-1: dashboard execution anchor + per-step spans +
+    #                     checkpoints (emits omium.execution.completed). The legacy
+    #                     ``--omium`` / CODESWARM_OMIUM=1 maps here.
+    #   "corpus"        — Mode-2: drive the execution-engine so each FAILING codeswarm
+    #                     task becomes a genuine omium.execution.failed carrying
+    #                     codeswarm's real failure signature -> mints recovery corpus.
+    # ``omium_enabled`` is kept as a derived convenience flag == (mode == "observability").
     omium_enabled: bool = False
+    omium_mode: str = "off"
     omium_workflow_id: str | None = None
 
     @classmethod
@@ -48,11 +59,22 @@ class Config:
           - CODESWARM_MAX_ITERATIONS
           - CODESWARM_MAX_RETRIES
           - CODESWARM_RUNS_DIR
-          - CODESWARM_OMIUM (enable) / CODESWARM_OMIUM_WORKFLOW_ID
+          - CODESWARM_OMIUM (legacy enable=observability) / CODESWARM_OMIUM_MODE
+            (off|observability|corpus) / CODESWARM_OMIUM_WORKFLOW_ID
         """
         api_key = os.environ.get("CODESWARM_API_KEY") or os.environ.get(
             "ANTHROPIC_API_KEY"
         )
+        # Resolve the Omium mode: explicit CODESWARM_OMIUM_MODE wins; the legacy
+        # CODESWARM_OMIUM=1 maps to "observability"; otherwise "off".
+        mode_env = (os.environ.get("CODESWARM_OMIUM_MODE") or "").strip().lower()
+        legacy_on = os.environ.get("CODESWARM_OMIUM", "").lower() in ("1", "true", "yes")
+        if mode_env in ("off", "observability", "corpus"):
+            omium_mode = mode_env
+        elif legacy_on:
+            omium_mode = "observability"
+        else:
+            omium_mode = "off"
         provider = os.environ.get("CODESWARM_LLM_PROVIDER", "anthropic").lower()
         # Model default depends on the provider (Vertex uses different ids).
         model_env = os.environ.get("CODESWARM_MODEL")
@@ -72,13 +94,16 @@ class Config:
             max_iterations=int(os.environ.get("CODESWARM_MAX_ITERATIONS", "10")),
             max_retries=int(os.environ.get("CODESWARM_MAX_RETRIES", "3")),
             runs_dir=os.environ.get("CODESWARM_RUNS_DIR", "runs"),
-            omium_enabled=os.environ.get("CODESWARM_OMIUM", "").lower()
-            in ("1", "true", "yes"),
+            omium_mode=omium_mode,
+            omium_enabled=(omium_mode == "observability"),
             omium_workflow_id=os.environ.get("CODESWARM_OMIUM_WORKFLOW_ID"),
         )
         for key, value in overrides.items():
             if value is not None and hasattr(cfg, key):
                 setattr(cfg, key, value)
+        # Keep the derived observability flag consistent with the final mode
+        # (an override may have changed omium_mode after construction).
+        cfg.omium_enabled = (cfg.omium_mode == "observability")
         # Safety net: if the provider ended up "vertex" (e.g. via a CLI override)
         # but no explicit model was given, use the Vertex model id (the direct-API
         # default id does not exist on Vertex).
