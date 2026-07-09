@@ -296,6 +296,48 @@ def extract_dominant_failure(trajectory) -> dict | None:
 # signature_token (kinds x files) is embedded there and NORMALIZE_v1 preserves words.
 CORPUS_NODE_NAME = "cs_oracle"
 
+# ── GREEN (desirable) arm constants ─────────────────────────────────────────
+# The seeded GREEN pool (Omium-platform/scripts/seed_codeswarm_corpus_green_pool.sql):
+# ONE workflow id, N pinned versions, each version's cs_oracle node carrying
+# `force_error_once` + a per-version `force_error_once_key` ("cs-green-<v>").
+# Mechanics (mirrors the PROVEN scripts/stress/recovery_load.py --mode green +
+# pr2_seed_l4_workflow_c9997.sql GREEN):
+#   * the ORIGINAL run executes the INLINE def below -> force_error_once counter
+#     (Redis, keyed GLOBALLY on force_error_once_key) increments to 1 -> raises ->
+#     a real omium.execution.failed whose signature derives from codeswarm's real
+#     failure message;
+#   * the authoritative RERUN fetches the pinned (green workflow, version=v) def
+#     from workflow-manager; its cs_oracle uses the SAME key -> counter hits 2 ->
+#     SUCCEEDS -> emit_side_effect writes the real orders ground-truth row ->
+#     Tier-1 signature_gone ∧ side-effect present -> verified_SUCCESS -> a
+#     DESIRABLE WORM reward row.
+# KEY EXHAUSTION: each key mints ONE green row, then its counter sits at 2 and a
+# later original using it would SUCCEED first try (no failure -> nothing minted —
+# a wasted run, never a fabricated row). EE bounds the counter with a 1h TTL set
+# on first use, and the EE-pod helper
+# (Omium-platform/scripts/stress/clear_codeswarm_green_keys.py) clears the pool
+# explicitly between batches. GreenKeyAllocator below hands each version out AT
+# MOST ONCE per clear-cycle so keys are never silently burned.
+GREEN_WORKFLOW_NAME = "codeswarm-corpus-cs_oracle-green"
+GREEN_KEY_PREFIX = "cs-green-"
+DEFAULT_GREEN_POOL_SIZE = 40
+
+
+def trajectory_recovered(trajectory) -> bool:
+    """True ONLY when the trajectory shows the swarm ACTUALLY recovered.
+
+    Eligibility for the GREEN (desirable) arm is honest by construction: there must
+    be a REAL recorded failure event AND the final oracle verdict must have PASSED
+    (the failure was genuinely recoverable — the swarm fixed it within budget).
+    A run with no failure has nothing to mint; a run whose verdict failed is the
+    RED (permanent) arm. Never fabricated (R12): polarity mirrors the trajectory's
+    real outcome.
+    """
+    verdict = getattr(trajectory, "verdict", None)
+    if not (verdict is not None and getattr(verdict, "passed", False)):
+        return False
+    return extract_dominant_failure(trajectory) is not None
+
 
 def _sanitize_node_name(failure: dict, task_id: str) -> str:
     """The constant seeded failing-node name (see CORPUS_NODE_NAME above).
@@ -375,6 +417,7 @@ def build_corpus_execution_body(
             # read_model_miss). Forward-compatible default; 0 is fine for failures-only corpus.
             "workflow_version": 1,
             "source": "codeswarm-corpus",
+            "corpus_polarity": "red",
             "task_id": task.id,
             "run_id": run_id,
             "difficulty": getattr(task, "difficulty", ""),
@@ -386,6 +429,81 @@ def build_corpus_execution_body(
     }
 
 
+def _orders_postconditions(node_name: str) -> list[dict]:
+    """The §3.7 programmatic orders db_row contract (same shape as the proven seeds)."""
+    return [
+        {
+            "step_id": node_name,
+            "effect_kind": "db_row",
+            "assertion": {
+                "store": "orders",
+                "match": {"execution_id": "$execution_id", "status": "succeeded"},
+                "expect": "exactly_one",
+            },
+            "live_probe": "db:orders?execution_id=$execution_id",
+        }
+    ]
+
+
+def build_corpus_green_workflow_definition(
+    node_name: str, message: str, force_key: str
+) -> dict:
+    """Inline def whose middle node fails ONCE (shared Redis counter) then heals.
+
+    Mirrors the proven recovery_load.py ``_green_def`` shape. The ONLY binding
+    contract with the seeded pinned version is (a) the same ``force_error_once_key``
+    (the cross-attempt counter is keyed on it, NOT the workflow name) and (b) the
+    same failing-node name so checkpoint replay reproduces at the right node. The
+    message embeds codeswarm's REAL failure identity — same builder as RED, so the
+    green rows land in the SAME signature cluster (the floor is per-signature:
+    yield >= 200 AND desirable >= 50).
+    """
+    return {
+        "name": GREEN_WORKFLOW_NAME,
+        "nodes": [
+            {"name": "ingest", "function": "ingest_node"},
+            {
+                "name": node_name,
+                "function": "process_node",
+                "force_error_once": message,
+                "force_error_once_key": force_key,
+                "emit_side_effect": "orders",
+            },
+            {"name": "summarize", "function": "summarize_node"},
+        ],
+        "edges": [
+            {"from": "START", "to": "ingest"},
+            {"from": "ingest", "to": node_name},
+            {"from": node_name, "to": "summarize"},
+            {"from": "summarize", "to": "END"},
+        ],
+        "postconditions": _orders_postconditions(node_name),
+    }
+
+
+def build_corpus_green_execution_body(
+    task,
+    run_id: str,
+    workflow_id: str,
+    workflow_definition: dict,
+    failure: dict,
+    *,
+    version: int,
+    force_key: str,
+) -> dict:
+    """POST /executions body for the GREEN (desirable) arm.
+
+    ``workflow_version`` MUST be the seeded pool version whose pinned def carries
+    ``force_key`` — the RERUNNING re-run fetches (workflow_id, version) from
+    workflow-manager and heals only if its key matches the original's counter.
+    """
+    body = build_corpus_execution_body(task, run_id, workflow_id, workflow_definition, failure)
+    body["metadata"]["workflow_version"] = int(version)
+    body["metadata"]["corpus_polarity"] = "green"
+    body["metadata"]["force_key"] = force_key
+    return body
+
+
 def _default_workflow_id() -> str:
     """A stable, valid UUID for codeswarm's corpus workflow.
 
@@ -394,6 +512,101 @@ def _default_workflow_id() -> str:
     this deterministic uuid5 is the fail-safe default so the anchor POST always validates.
     """
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, "codeswarm.omium.corpus.workflow"))
+
+
+def _default_green_workflow_id() -> str:
+    """Deterministic id of the seeded GREEN pool workflow (same uuid5 derivation as RED).
+
+    MUST equal the id in Omium-platform/scripts/seed_codeswarm_corpus_green_pool.sql:
+    82a67367-4d6d-5abd-97d2-00d33a7ef863.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, "codeswarm.omium.corpus.workflow.green"))
+
+
+class GreenKeyAllocator:
+    """File-backed round-robin allocator over the seeded GREEN pool versions 1..N.
+
+    Each seeded version v carries force_error_once_key "cs-green-<v>" whose global
+    Redis counter mints EXACTLY ONE green row and is then exhausted (a later original
+    on the same key succeeds first-try -> nothing minted, a wasted run) until the
+    EE-pod key-clear helper resets it (or its 1h TTL lapses). This allocator hands
+    each version out AT MOST ONCE per clear-cycle:
+
+      * ``allocate()``     -> version int, or None when the cycle is exhausted
+                              (caller must SKIP the green mint — never fall back to
+                              red for a recovered trajectory);
+      * ``release(v)``     -> return v to the pool (ONLY when the POST never reached
+                              EE, i.e. the counter was never touched);
+      * ``mark_cleared()`` -> start a fresh cycle AFTER the EE-pod helper ran.
+
+    State is a small JSON file (atomic tmp+rename write) so sequential CLI runs and
+    the volume runner share one cycle. Single-writer by design (the volume runner is
+    one process); concurrent writers at worst waste runs, never fabricate rows.
+    """
+
+    def __init__(self, state_path: str, pool_size: int | None = None) -> None:
+        self.state_path = str(state_path)
+        env_size = os.environ.get("CODESWARM_GREEN_POOL_SIZE")
+        self.pool_size = int(pool_size or env_size or DEFAULT_GREEN_POOL_SIZE)
+        self._state = self._load()
+
+    # -- persistence ---------------------------------------------------------
+    def _load(self) -> dict:
+        import json
+
+        try:
+            with open(self.state_path, encoding="utf-8") as fh:
+                st = json.load(fh)
+            return {
+                "next": int(st.get("next", 1)),
+                "freed": [int(v) for v in st.get("freed", [])],
+            }
+        except Exception:  # noqa: BLE001 — missing/corrupt state starts a fresh cycle
+            return {"next": 1, "freed": []}
+
+    def _save(self) -> None:
+        import json
+        import os as _os
+
+        tmp = f"{self.state_path}.tmp"
+        try:
+            _os.makedirs(_os.path.dirname(self.state_path) or ".", exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"next": self._state["next"], "freed": self._state["freed"],
+                           "pool_size": self.pool_size}, fh)
+            _os.replace(tmp, self.state_path)
+        except Exception as e:  # noqa: BLE001 — persistence is best-effort
+            log.warning("green pool state save failed (%s): %s", self.state_path, e)
+
+    # -- API -----------------------------------------------------------------
+    @property
+    def remaining(self) -> int:
+        return max(0, self.pool_size - self._state["next"] + 1) + len(self._state["freed"])
+
+    def allocate(self) -> int | None:
+        if self._state["freed"]:
+            v = self._state["freed"].pop(0)
+        elif self._state["next"] <= self.pool_size:
+            v = self._state["next"]
+            self._state["next"] += 1
+        else:
+            return None
+        self._save()
+        return int(v)
+
+    def release(self, version: int) -> None:
+        """Return a version whose POST never reached EE (counter untouched)."""
+        v = int(version)
+        if v not in self._state["freed"]:
+            self._state["freed"].append(v)
+            self._save()
+
+    def mark_cleared(self) -> None:
+        """Start a fresh cycle. Call ONLY after the EE-pod key-clear helper succeeded
+        (clearing a key with an in-flight green recovery would flip its re-run back
+        to a failure — the volume runner guards this by settling greens first)."""
+        self._state = {"next": 1, "freed": []}
+        self._save()
 
 
 class OmiumCorpusRun:
@@ -412,12 +625,21 @@ class OmiumCorpusRun:
         api_base: str | None = None,
         api_key: str | None = None,
         workflow_id: str | None = None,
+        green_workflow_id: str | None = None,
+        green_allocator: "GreenKeyAllocator | None" = None,
     ) -> None:
         self.config = config
         self._base = api_base
         self._key = api_key
         self._workflow_id = workflow_id
+        self._green_workflow_id = green_workflow_id
+        self._green_allocator_inst = green_allocator
         self.execution_id: str | None = None
+        # Set on a successful mint: "red" (verified_failure arm) or "green"
+        # (verified_success arm). None when nothing was minted.
+        self.polarity: str | None = None
+        # The seeded pool version used by a green mint (for logs/manifests).
+        self.green_version: int | None = None
 
     # -- config resolution -------------------------------------------------
     def _resolve_config(self) -> bool:
@@ -455,12 +677,32 @@ class OmiumCorpusRun:
         )
         return wf or _default_workflow_id()
 
+    def _resolve_green_workflow_id(self) -> str:
+        if self._green_workflow_id:
+            return self._green_workflow_id
+        return os.environ.get("CODESWARM_OMIUM_GREEN_WORKFLOW_ID") or _default_green_workflow_id()
+
+    def _green_allocator(self) -> "GreenKeyAllocator":
+        if self._green_allocator_inst is None:
+            state = os.environ.get("CODESWARM_GREEN_POOL_STATE") or os.path.join(
+                getattr(self.config, "runs_dir", "runs") or "runs", ".cs_green_pool.json"
+            )
+            self._green_allocator_inst = GreenKeyAllocator(state)
+        return self._green_allocator_inst
+
     # -- minting -----------------------------------------------------------
     def mint(self, task, run_id: str, trajectory) -> str | None:
-        """Drive EE to emit omium.execution.failed for a FAILED codeswarm run.
+        """Turn a codeswarm trajectory into an honest corpus row via EE.
 
-        Returns the created execution_id, or None when the run passed (nothing to mint)
-        or Omium is unreachable. Never raises into the caller.
+        Polarity MIRRORS the trajectory's REAL outcome (R12 — never fabricated):
+          * no failure event            -> nothing to mint (None);
+          * failure + final verdict PASSED (the swarm actually recovered) -> GREEN
+            arm: fail-once seeded workflow -> the authoritative re-run HEALS ->
+            verified_success (desirable);
+          * failure + final verdict FAILED (never fixed within budget) -> RED arm:
+            permanent force_error -> the re-run reproduces -> verified_failure.
+
+        Returns the created execution_id or None. Never raises into the caller.
         """
         failure = extract_dominant_failure(trajectory)
         if failure is None:
@@ -469,13 +711,12 @@ class OmiumCorpusRun:
         if not self._resolve_config():
             log.warning("omium corpus: no API base/key — skipping mint for %s", run_id)
             return None
+        if trajectory_recovered(trajectory):
+            return self._mint_green(task, run_id, failure)
+        return self._mint_red(task, run_id, failure)
 
-        workflow_id = self._resolve_workflow_id()
-        node_name = _sanitize_node_name(failure, task.id)
-        message = build_corpus_failure_message(failure, task.id)
-        wf_def = build_corpus_workflow_definition(node_name, message)
-        body = build_corpus_execution_body(task, run_id, workflow_id, wf_def, failure)
-
+    def _post_execution(self, body: dict) -> str | None:
+        """POST /executions; returns the execution id or None. Fail-soft."""
         try:
             import httpx
 
@@ -486,16 +727,69 @@ class OmiumCorpusRun:
                 timeout=30,
             )
             if r.status_code in (200, 201):
-                self.execution_id = r.json().get("id")
-                log.info(
-                    "omium corpus: minted failing execution %s (task=%s sig_token=%s)",
-                    self.execution_id, task.id, failure.get("signature_token"),
-                )
-                return self.execution_id
+                return r.json().get("id")
             log.warning(
                 "omium corpus: POST /executions failed HTTP %s %s",
                 r.status_code, r.text[:200],
             )
         except Exception as e:  # noqa: BLE001 — fail-soft
             log.warning("omium corpus: mint failed (continuing local run): %s", e)
+        return None
+
+    def _mint_red(self, task, run_id: str, failure: dict) -> str | None:
+        workflow_id = self._resolve_workflow_id()
+        node_name = _sanitize_node_name(failure, task.id)
+        message = build_corpus_failure_message(failure, task.id)
+        wf_def = build_corpus_workflow_definition(node_name, message)
+        body = build_corpus_execution_body(task, run_id, workflow_id, wf_def, failure)
+        eid = self._post_execution(body)
+        if eid:
+            self.execution_id = eid
+            self.polarity = "red"
+            log.info(
+                "omium corpus: minted RED (verified_failure) execution %s (task=%s sig_token=%s)",
+                eid, task.id, failure.get("signature_token"),
+            )
+        return eid
+
+    def _mint_green(self, task, run_id: str, failure: dict) -> str | None:
+        """GREEN arm: the swarm recovered, so mint through the fail-once pool.
+
+        A recovered trajectory is NEVER minted red — if no pool key is available the
+        mint is SKIPPED (honesty over volume) and the caller is told to clear keys.
+        """
+        allocator = self._green_allocator()
+        version = allocator.allocate()
+        if version is None:
+            log.warning(
+                "omium corpus: GREEN pool exhausted — run the EE-pod key-clear helper "
+                "(Omium-platform/scripts/stress/clear_codeswarm_green_keys.py) then reset "
+                "the cycle (GreenKeyAllocator.mark_cleared / corpus_runner --clear-keys-cmd). "
+                "SKIPPING green mint for %s (a recovered trajectory is never minted red).",
+                run_id,
+            )
+            return None
+        force_key = f"{GREEN_KEY_PREFIX}{version}"
+        # SAME message builder as RED -> red+green land in the SAME signature cluster
+        # (the training floor is per-signature: yield >= 200 AND desirable >= 50).
+        message = build_corpus_failure_message(failure, task.id)
+        node_name = _sanitize_node_name(failure, task.id)
+        wf_def = build_corpus_green_workflow_definition(node_name, message, force_key)
+        body = build_corpus_green_execution_body(
+            task, run_id, self._resolve_green_workflow_id(), wf_def, failure,
+            version=version, force_key=force_key,
+        )
+        eid = self._post_execution(body)
+        if eid:
+            self.execution_id = eid
+            self.polarity = "green"
+            self.green_version = version
+            log.info(
+                "omium corpus: minted GREEN (verified_success) execution %s "
+                "(task=%s version=%s key=%s sig_token=%s)",
+                eid, task.id, version, force_key, failure.get("signature_token"),
+            )
+            return eid
+        # The POST never reached EE -> the key's counter is untouched; reuse it.
+        allocator.release(version)
         return None

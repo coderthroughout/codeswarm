@@ -87,9 +87,12 @@ async def _run_one(config: Config, task: Task, use_mock: bool) -> TaskResult:
 
         run_id = f"{task.id}-{uuid.uuid4().hex[:8]}"
         trajectory = await engine.run(task, run_id=run_id)
-        execution_id = OmiumCorpusRun(config).mint(task, run_id, trajectory)
+        corpus = OmiumCorpusRun(config)
+        execution_id = corpus.mint(task, run_id, trajectory)
         if execution_id:
-            print(f"  omium corpus: minted failing execution {execution_id}")
+            print(
+                f"  omium corpus: minted {corpus.polarity or 'red'} execution {execution_id}"
+            )
     else:
         trajectory = await engine.run(task)
 
