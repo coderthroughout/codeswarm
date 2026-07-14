@@ -53,6 +53,35 @@ python -m codeswarm run --task math_utils --model claude-opus-4-8
 
 The default model is `claude-opus-4-8` (override with `--model` or `CODESWARM_MODEL`).
 
+## Run for real (Nebius Token Factory / any OpenAI-compatible endpoint)
+
+Provider `openai_compatible` speaks the OpenAI `/chat/completions` wire format
+over stdlib (no extra install). Default endpoint is **Nebius Token Factory**
+(`https://api.tokenfactory.nebius.com/v1/`), default model **`MiniMaxAI/MiniMax-M3`**.
+
+codeswarm's secret convention is **environment variables, never files**. The
+Token Factory key lives in AWS Secrets Manager (`omium/staging/nebius-token-factory`,
+JSON `{"api_key": ...}`); fetch it into the env for local runs:
+
+```bash
+export NEBIUS_API_KEY="$(aws secretsmanager get-secret-value \
+  --profile omium-stg --secret-id omium/staging/nebius-token-factory \
+  --query SecretString --output text | python3 -c 'import json,sys; print(json.load(sys.stdin)["api_key"])')"
+
+python -m codeswarm run --task math_utils --provider openai_compatible
+# or via env instead of the flag:
+CODESWARM_LLM_PROVIDER=openai_compatible python -m codeswarm run --task math_utils
+```
+
+Knobs (all env-overridable): `CODESWARM_OPENAI_API_KEY` (wins over
+`NEBIUS_API_KEY`), `CODESWARM_OPENAI_BASE_URL`, `CODESWARM_MODEL` /
+`--model`, `CODESWARM_OPENAI_MAX_TOKENS` (default **8192** — reasoning models
+truncate below that; don't lower it).
+
+Gotcha (live-verified): Token Factory answers a **wrong model id with HTTP 200
+and empty `choices`** — the client raises on zero choices instead of returning
+silent empty text.
+
 ## Test
 
 ```bash
@@ -65,7 +94,7 @@ python -m pytest -q     # green with NO API key (MockClient path)
 codeswarm/
   pyproject.toml  README.md  DESIGN.md
   codeswarm/ __init__.py __main__.py cli.py config.py
-    llm/     client.py            # LLMClient Protocol, MockClient, AnthropicClient
+    llm/     client.py            # LLMClient Protocol, MockClient, AnthropicClient, OpenAICompatibleClient
     trace/   types.py recorder.py # Event/StepResult/Verdict/Trajectory + recorder
     tools/   base.py fs.py shell.py testing.py
     sandbox/ workspace.py         # ephemeral, path-confined temp dir per run
