@@ -128,18 +128,64 @@ def test_workflow_definition_has_force_error_node():
     assert ("summarize", "END") in froms
 
 
-def test_node_name_is_the_seeded_constant():
-    # The failing node MUST equal the platform's seeded pinned-version node
-    # (seed_codeswarm_corpus_workflow.sql) or RERUNNING can't reproduce the failure.
+def test_node_is_chosen_from_the_seeded_set():
+    # The failing node MUST be one of the platform's seeded node names (the multi-node
+    # pinned defs — docs/seed_multinode_proposal.sql) or RERUNNING can't reproduce the
+    # failure. It is no longer a single hardcoded constant.
     failure = oe.extract_dominant_failure(_failing_trajectory())
-    assert oe._sanitize_node_name(failure, "math_utils") == "cs_oracle"
-    assert oe._sanitize_node_name({"failing_tests": []}, "My Task!") == "cs_oracle"
+    node = oe.select_corpus_node(failure, "math_utils")
+    assert node in oe.CORPUS_NODE_NAMES
+    # cs_oracle stays the head/back-compat default and legacy alias.
     assert oe.CORPUS_NODE_NAME == "cs_oracle"
+    assert oe.CORPUS_NODE_NAMES[0] == "cs_oracle"
+    # The historical private name still resolves (delegates to select_corpus_node).
+    assert oe._sanitize_node_name(failure, "math_utils") == node
 
 
-def test_diversity_lives_in_the_message_not_the_node():
-    # With the node constant, the signature's diversity axis is the message — it must
-    # still embed the real per-task signature_token.
+def test_node_selection_is_deterministic():
+    # Same failure identity -> SAME node every time (replay must localize identically).
+    failure = oe.extract_dominant_failure(_failing_trajectory())
+    picks = {oe.select_corpus_node(failure, "math_utils") for _ in range(20)}
+    assert len(picks) == 1
+
+
+def test_node_selection_falls_back_when_token_missing():
+    # No signature_token/error_type -> keyed on task_id, still deterministic + valid.
+    a = oe.select_corpus_node({"failing_tests": []}, "My Task!")
+    b = oe.select_corpus_node({"failing_tests": []}, "My Task!")
+    assert a == b
+    assert a in oe.CORPUS_NODE_NAMES
+
+
+def test_distinct_decisive_tokens_across_task_families():
+    # The gT5/gT6 fix: distinct signature families must NOT collapse onto one node.
+    # These tokens mirror codeswarm's real per-family signature_tokens.
+    families = [
+        "AssertionError::test_math_utils.py",
+        "TypeError+ValueError::test_parser.py",
+        "SyntaxError::test_planner.py",
+        "ImportError::test_data_structures.py",
+        "KeyError::test_algorithms.py",
+        "AttributeError::test_bugfix.py",
+        "RuntimeError::test_synth.py",
+        "IndexError::test_validate.py",
+    ]
+    nodes = {oe.select_corpus_node({"signature_token": t}, "t") for t in families}
+    # More than the single collapsed token — the decisive axis is diverse now.
+    assert len(nodes) >= 3, f"decisive-node axis collapsed: {nodes}"
+
+
+def test_node_version_round_trips_the_set():
+    # corpus_node_version pins the RED pinned-def version that carries the node.
+    for i, name in enumerate(oe.CORPUS_NODE_NAMES):
+        assert oe.corpus_node_version(name) == i + 1
+    # Unknown node -> safe fallback to version 1 (legacy cs_oracle def).
+    assert oe.corpus_node_version("cs_nonexistent") == 1
+
+
+def test_diversity_lives_in_both_node_and_message():
+    # The signature's diversity axes are BOTH the failing node (WHERE) and the message
+    # (WHAT); the message must still embed the real per-task signature_token.
     failure = oe.extract_dominant_failure(_failing_trajectory())
     msg = oe.build_corpus_failure_message(failure, "math_utils")
     assert failure["signature_token"] in msg

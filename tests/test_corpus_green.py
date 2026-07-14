@@ -202,6 +202,46 @@ def test_allocator_mark_cleared_resets_cycle(tmp_path):
     assert a.allocate() == 1
 
 
+def test_allocator_version_node_interleave():
+    # version -> node is the fixed residue interleave the seed mirrors.
+    n = len(oe.CORPUS_NODE_NAMES)
+    for v in range(1, 2 * n + 1):
+        assert oe.GreenKeyAllocator.version_node(v) == oe.CORPUS_NODE_NAMES[(v - 1) % n]
+
+
+def test_allocator_for_node_stays_in_sub_pool(tmp_path):
+    n = len(oe.CORPUS_NODE_NAMES)
+    a = oe.GreenKeyAllocator(str(tmp_path / "pool.json"), pool_size=3 * n)
+    for name in oe.CORPUS_NODE_NAMES:
+        v1 = a.allocate_for_node(name)
+        v2 = a.allocate_for_node(name)
+        assert v1 is not None and v2 is not None
+        assert oe.GreenKeyAllocator.version_node(v1) == name
+        assert oe.GreenKeyAllocator.version_node(v2) == name
+
+
+def test_allocator_for_node_exhausts_independently(tmp_path):
+    # A node with exactly one version in range exhausts after one draw; other nodes stay.
+    a = oe.GreenKeyAllocator(str(tmp_path / "pool.json"), pool_size=len(oe.CORPUS_NODE_NAMES))
+    first = oe.CORPUS_NODE_NAMES[0]
+    second = oe.CORPUS_NODE_NAMES[1]
+    assert a.allocate_for_node(first) == 1
+    assert a.allocate_for_node(first) is None  # sub-pool spent
+    assert a.allocate_for_node(second) == 2    # a different node still has capacity
+
+
+def test_allocator_legacy_state_migrates(tmp_path):
+    import json
+
+    path = tmp_path / "pool.json"
+    # Legacy on-disk format (next/freed) must migrate to the used-set model.
+    path.write_text(json.dumps({"next": 4, "freed": [2]}), encoding="utf-8")
+    a = oe.GreenKeyAllocator(str(path), pool_size=10)
+    # Legacy next=4 => versions 1,2,3 handed out; freed=[2] => used {1,3}.
+    assert a.allocate() == 2  # smallest unused
+    assert a.allocate() == 4  # now used {1,2,3} -> next unused is 4
+
+
 # --------------------------------------------------------------------------- #
 # mint(): honest polarity routing
 # --------------------------------------------------------------------------- #
@@ -223,18 +263,25 @@ def test_mint_routes_recovered_trajectory_to_green(tmp_path):
     try:
         run = _corpus_run(tmp_path)
         task = Task(id="math_utils", prompt="p", difficulty="easy")
+        # The fixture's signature_token deterministically selects one node from the set;
+        # the green version drawn MUST belong to that node's sub-pool.
+        expected_node = oe.select_corpus_node(dict(_FAILURE_PAYLOAD), task.id)
         eid = run.mint(task, "run-1", _recovered_trajectory())
         assert eid == "exec-1"
         assert run.polarity == "green"
-        assert run.green_version == 1
+        version = run.green_version
+        # version -> node interleave keeps the green row on the chosen node.
+        assert oe.GreenKeyAllocator.version_node(version) == expected_node
         body = recorder["posts"][0]["json"]
         assert body["workflow_id"] == "green-wf-id"
         node = body["metadata"]["workflow_definition"]["nodes"][1]
-        assert node["force_error_once_key"] == "cs-green-1"
+        assert node["name"] == expected_node
+        assert node["force_error_once_key"] == f"cs-green-{version}"
         assert "force_error" not in node
         # The message still embeds codeswarm's REAL failure identity.
         assert _FAILURE_PAYLOAD["signature_token"] in node["force_error_once"]
-        assert body["metadata"]["workflow_version"] == 1
+        assert body["metadata"]["workflow_version"] == version
+        assert body["metadata"]["codeswarm_failing_node"] == expected_node
     finally:
         sys.modules.pop("httpx", None)
 
@@ -262,18 +309,26 @@ def test_mint_green_skips_when_pool_exhausted_never_red(tmp_path):
     recorder: dict = {}
     _install_fake_httpx(recorder)
     try:
-        run = _corpus_run(tmp_path, pool_size=1)
         task = Task(id="math_utils", prompt="p")
+        node = oe.select_corpus_node(dict(_FAILURE_PAYLOAD), task.id)
+        # Size the pool so the CHOSEN node's sub-pool holds exactly ONE version
+        # (the first version carrying that node under the fixed interleave).
+        n = len(oe.CORPUS_NODE_NAMES)
+        pool_size = oe.CORPUS_NODE_NAMES.index(node) + 1
+        assert sum(1 for v in range(1, pool_size + 1)
+                   if oe.GreenKeyAllocator.version_node(v) == node) == 1
+        run = _corpus_run(tmp_path, pool_size=pool_size)
         assert run.mint(task, "run-1", _recovered_trajectory()) == "exec-1"
-        # Pool now exhausted: a recovered trajectory is SKIPPED, never minted red.
+        # That node's sub-pool now exhausted: a recovered trajectory is SKIPPED, never red.
         run2 = oe.OmiumCorpusRun(
             Config(), api_base="https://api-staging.omium.ai/api/v1", api_key="k",
             workflow_id="red-wf-id", green_workflow_id="green-wf-id",
-            green_allocator=oe.GreenKeyAllocator(str(tmp_path / "pool.json"), pool_size=1),
+            green_allocator=oe.GreenKeyAllocator(str(tmp_path / "pool.json"), pool_size=pool_size),
         )
         assert run2.mint(task, "run-2", _recovered_trajectory()) is None
         assert run2.polarity is None
         assert len(recorder["posts"]) == 1  # no second POST happened
+        assert n >= 1  # sanity: the node set is non-empty
     finally:
         sys.modules.pop("httpx", None)
 
@@ -282,15 +337,19 @@ def test_mint_green_releases_key_on_post_failure(tmp_path):
     recorder: dict = {}
     _install_fake_httpx(recorder, status_code=500)
     try:
-        allocator = oe.GreenKeyAllocator(str(tmp_path / "pool.json"), pool_size=1)
+        task = Task(id="math_utils", prompt="p")
+        node = oe.select_corpus_node(dict(_FAILURE_PAYLOAD), task.id)
+        # Pool must include a version carrying the chosen node.
+        pool_size = oe.CORPUS_NODE_NAMES.index(node) + 1
+        allocator = oe.GreenKeyAllocator(str(tmp_path / "pool.json"), pool_size=pool_size)
+        before = allocator.remaining
         run = oe.OmiumCorpusRun(
             Config(), api_base="http://x/api/v1", api_key="k",
             green_workflow_id="g", green_allocator=allocator,
         )
-        task = Task(id="math_utils", prompt="p")
         assert run.mint(task, "run-1", _recovered_trajectory()) is None
-        # The POST never reached EE -> the key was returned to the pool.
-        assert allocator.remaining == 1
+        # The POST never reached EE -> the key was returned to the pool (unchanged count).
+        assert allocator.remaining == before
     finally:
         sys.modules.pop("httpx", None)
 
