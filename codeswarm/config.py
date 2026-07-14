@@ -15,6 +15,17 @@ DEFAULT_MODEL = "claude-opus-4-8"
 # Claude on Vertex AI (GCP). Model ids + regions differ from the direct API.
 DEFAULT_VERTEX_MODEL = "claude-sonnet-4-5"
 DEFAULT_VERTEX_REGION = "us-east5"
+# OpenAI-compatible provider (Nebius Token Factory by default). Token Factory
+# model ids are HuggingFace-style "org/name" strings; MiniMax-M3 is the agreed
+# swarm model (exact id live-verified in the account catalog 2026-07-13).
+# Override with CODESWARM_MODEL / --model. CAUTION: Token Factory answers a
+# WRONG model id with HTTP 200 + EMPTY choices — the client treats zero
+# choices as a hard error instead of returning silent empty text.
+DEFAULT_OPENAI_COMPAT_MODEL = "MiniMaxAI/MiniMax-M3"
+DEFAULT_OPENAI_COMPAT_BASE_URL = "https://api.tokenfactory.nebius.com/v1/"
+# Reasoning models spend output budget on thinking; below ~8k they truncate
+# mid-answer (known production scar). Keep >= 8192 unless you know better.
+DEFAULT_OPENAI_COMPAT_MAX_TOKENS = 8192
 
 
 @dataclass
@@ -24,11 +35,18 @@ class Config:
     model: str = DEFAULT_MODEL
     api_key: str | None = None
 
-    # LLM provider for the real (non-mock) path: "anthropic" (direct API key) or
-    # "vertex" (Claude on GCP Vertex AI, auth via Application Default Credentials).
+    # LLM provider for the real (non-mock) path:
+    #   "anthropic"         — direct Anthropic API key (default).
+    #   "vertex"            — Claude on GCP Vertex AI (Application Default Credentials).
+    #   "openai_compatible" — any OpenAI-compatible /chat/completions endpoint
+    #                         (default: Nebius Token Factory). Bearer key from
+    #                         CODESWARM_OPENAI_API_KEY or NEBIUS_API_KEY.
     llm_provider: str = "anthropic"
     vertex_project: str | None = None
     vertex_region: str = DEFAULT_VERTEX_REGION
+    openai_base_url: str = DEFAULT_OPENAI_COMPAT_BASE_URL
+    openai_api_key: str | None = None
+    openai_max_tokens: int = DEFAULT_OPENAI_COMPAT_MAX_TOKENS
     max_iterations: int = 10  # bound on the number of plan steps executed
     max_retries: int = 3      # attempts per step (code -> test -> review loop)
     runs_dir: str = "runs"    # where CLI writes <run_id>.jsonl trajectories
@@ -55,6 +73,12 @@ class Config:
 
         Recognised env vars:
           - ANTHROPIC_API_KEY / CODESWARM_API_KEY
+          - CODESWARM_LLM_PROVIDER (anthropic|vertex|openai_compatible)
+          - CODESWARM_OPENAI_API_KEY / NEBIUS_API_KEY (openai_compatible bearer key;
+            codeswarm's secret convention is env vars, same as the Anthropic key —
+            no key files)
+          - CODESWARM_OPENAI_BASE_URL (default: Nebius Token Factory)
+          - CODESWARM_OPENAI_MAX_TOKENS (default 8192; reasoning models truncate below)
           - CODESWARM_MODEL
           - CODESWARM_MAX_ITERATIONS
           - CODESWARM_MAX_RETRIES
@@ -76,12 +100,14 @@ class Config:
         else:
             omium_mode = "off"
         provider = os.environ.get("CODESWARM_LLM_PROVIDER", "anthropic").lower()
-        # Model default depends on the provider (Vertex uses different ids).
+        # Model default depends on the provider (each uses different ids).
         model_env = os.environ.get("CODESWARM_MODEL")
         if model_env:
             model = model_env
         elif provider == "vertex":
             model = DEFAULT_VERTEX_MODEL
+        elif provider == "openai_compatible":
+            model = DEFAULT_OPENAI_COMPAT_MODEL
         else:
             model = DEFAULT_MODEL
         cfg = cls(
@@ -91,6 +117,16 @@ class Config:
             vertex_project=os.environ.get("CODESWARM_VERTEX_PROJECT")
             or os.environ.get("GOOGLE_CLOUD_PROJECT"),
             vertex_region=os.environ.get("CODESWARM_VERTEX_REGION", DEFAULT_VERTEX_REGION),
+            openai_base_url=os.environ.get(
+                "CODESWARM_OPENAI_BASE_URL", DEFAULT_OPENAI_COMPAT_BASE_URL
+            ),
+            openai_api_key=os.environ.get("CODESWARM_OPENAI_API_KEY")
+            or os.environ.get("NEBIUS_API_KEY"),
+            openai_max_tokens=int(
+                os.environ.get(
+                    "CODESWARM_OPENAI_MAX_TOKENS", str(DEFAULT_OPENAI_COMPAT_MAX_TOKENS)
+                )
+            ),
             max_iterations=int(os.environ.get("CODESWARM_MAX_ITERATIONS", "10")),
             max_retries=int(os.environ.get("CODESWARM_MAX_RETRIES", "3")),
             runs_dir=os.environ.get("CODESWARM_RUNS_DIR", "runs"),
@@ -104,9 +140,12 @@ class Config:
         # Keep the derived observability flag consistent with the final mode
         # (an override may have changed omium_mode after construction).
         cfg.omium_enabled = (cfg.omium_mode == "observability")
-        # Safety net: if the provider ended up "vertex" (e.g. via a CLI override)
-        # but no explicit model was given, use the Vertex model id (the direct-API
-        # default id does not exist on Vertex).
-        if cfg.llm_provider == "vertex" and not model_env and cfg.model == DEFAULT_MODEL:
-            cfg.model = DEFAULT_VERTEX_MODEL
+        # Safety net: if the provider was switched via a CLI override but no
+        # explicit model was given, use that provider's default id (the direct-API
+        # default id does not exist on Vertex or Token Factory).
+        if not model_env and cfg.model == DEFAULT_MODEL:
+            if cfg.llm_provider == "vertex":
+                cfg.model = DEFAULT_VERTEX_MODEL
+            elif cfg.llm_provider == "openai_compatible":
+                cfg.model = DEFAULT_OPENAI_COMPAT_MODEL
         return cfg

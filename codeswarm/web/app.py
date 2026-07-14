@@ -18,7 +18,7 @@ from codeswarm.agents.planner import PlannerAgent
 from codeswarm.agents.reviewer import ReviewerAgent
 from codeswarm.agents.tester import TesterAgent
 from codeswarm.config import Config
-from codeswarm.llm.client import AnthropicClient
+from codeswarm.llm.client import build_real_client
 from codeswarm.tasks import get_task
 from codeswarm.tasks.spec import Task
 from codeswarm.tools import default_tools
@@ -101,7 +101,7 @@ async def _run_stream(prompt: str, task_id: str | None):
             wf.call = wrapped
         return tools
 
-    llm = AnthropicClient(config)
+    llm = build_real_client(config)
     engine = WorkflowEngine(
         config=config,
         llm=llm,

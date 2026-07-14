@@ -19,7 +19,7 @@ from codeswarm.agents.planner import PlannerAgent
 from codeswarm.agents.reviewer import ReviewerAgent
 from codeswarm.agents.tester import TesterAgent
 from codeswarm.config import Config
-from codeswarm.llm.client import AnthropicClient, MockClient
+from codeswarm.llm.client import MockClient, build_real_client
 from codeswarm.tasks import BUILTIN_TASKS, get_task, list_tasks
 from codeswarm.tasks.spec import Task, TaskResult
 from codeswarm.trace.types import Trajectory
@@ -33,7 +33,7 @@ def _build_engine(config: Config, task: Task, use_mock: bool) -> WorkflowEngine:
         # reference_solution is mock-only; the real client never sees it.
         llm = MockClient(solutions=task.reference_solution)
     else:
-        llm = AnthropicClient(config)
+        llm = build_real_client(config)
 
     executor = LocalExecutor(
         coder=CoderAgent(),
@@ -217,8 +217,11 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument(
         "--provider",
         default=None,
-        choices=["anthropic", "vertex"],
-        help="Real LLM provider: anthropic (API key) or vertex (Claude on GCP).",
+        choices=["anthropic", "vertex", "openai_compatible"],
+        help=(
+            "Real LLM provider: anthropic (API key), vertex (Claude on GCP), or "
+            "openai_compatible (Nebius Token Factory / any OpenAI-wire endpoint)."
+        ),
     )
     common.add_argument("--mock", action="store_true", help="Use the offline MockClient.")
     common.add_argument("--runs-dir", default=None, help="Where to write trajectories.")
