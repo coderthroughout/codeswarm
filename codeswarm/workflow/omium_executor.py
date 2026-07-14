@@ -22,6 +22,7 @@ Config/env:
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import uuid
@@ -287,14 +288,36 @@ def extract_dominant_failure(trajectory) -> dict | None:
     return None
 
 
-# The CONSTANT failing-node name, shared with the platform's seeded codeswarm workflow
-# (Omium-platform/scripts/seed_codeswarm_corpus_workflow.sql, workflow id
-# 8b628198-fd99-53ce-898d-2b53c647374d version 1). RERUNNING fetches THAT pinned def
-# from workflow-manager — NOT this inline def — so the failing node must be the SAME
-# name on both sides or checkpoint replay can't reproduce at the right node. The WHERE
-# signal (failing test files) still reaches the signature via the MESSAGE: the
-# signature_token (kinds x files) is embedded there and NORMALIZE_v1 preserves words.
-CORPUS_NODE_NAME = "cs_oracle"
+# The SET of distinctly-named failing nodes, shared with the platform's seeded
+# codeswarm workflow (Omium-platform/scripts/seed_codeswarm_corpus_workflow.sql — the
+# multi-node proposal is docs/seed_multinode_proposal.sql). RERUNNING fetches the
+# pinned def from workflow-manager — NOT this inline def — so the failing node must be
+# a name that EXISTS in the pinned def or checkpoint replay can't reproduce at the
+# right node.
+#
+# WHY A SET (the gT5/gT6 fix): the platform's failure_signature_hash (EE
+# app/services/signature.py) is sha256(error_type | NORMALIZE_v1(message) |
+# FAILING_NODE) and the recovery-orchestrator's ``decisive_step`` tracks that SAME
+# failing node. When every codeswarm row pinned the node to one constant ("cs_oracle"),
+# the WHERE axis of the signature — and therefore the decisive_step token — COLLAPSED to
+# a single value across all 16-21 signature clusters, leaving gT5/gT6 UNDECIDED. Choosing
+# the failing node deterministically from this set restores a diverse decisive-step axis
+# (and further sub-divides the signature space) while staying fully reproducible: the same
+# task always localizes to the same node on the authoritative re-run.
+#
+# ``cs_oracle`` stays FIRST so it remains the default/back-compat node (the legacy
+# single-node seed still reproduces the subset of rows that hash to index 0).
+CORPUS_NODE_NAMES: tuple[str, ...] = (
+    "cs_oracle",    # test-oracle / assertion failures (legacy default, index 0)
+    "cs_parser",    # parse / syntax / import-time failures
+    "cs_planner",   # planning / spec / structure failures
+    "cs_synth",     # synthesis / codegen failures
+    "cs_validator",  # validation / type / contract failures
+)
+
+# Back-compat alias: the historical single-node constant is now the head of the set.
+# Kept so any external reference (and the legacy seed) still resolves to the default node.
+CORPUS_NODE_NAME = CORPUS_NODE_NAMES[0]
 
 # ── GREEN (desirable) arm constants ─────────────────────────────────────────
 # The seeded GREEN pool (Omium-platform/scripts/seed_codeswarm_corpus_green_pool.sql):
@@ -339,14 +362,55 @@ def trajectory_recovered(trajectory) -> bool:
     return extract_dominant_failure(trajectory) is not None
 
 
-def _sanitize_node_name(failure: dict, task_id: str) -> str:
-    """The constant seeded failing-node name (see CORPUS_NODE_NAME above).
+def select_corpus_node(failure: dict, task_id: str) -> str:
+    """Deterministically pick ONE failing node from ``CORPUS_NODE_NAMES``.
 
-    Signature diversity is carried ENTIRELY by the force_error message (which embeds
-    codeswarm's real signature_token); the node axis is pinned so the seeded pinned
-    workflow version can reproduce the failure on the authoritative re-run.
+    This is the de-hardcoded successor to the old constant node. The failing NODE is
+    the WHERE axis of the platform's ``failure_signature_hash`` (EE
+    app/services/signature.py) AND the value the recovery-orchestrator records as
+    ``decisive_step``. Pinning it to one constant collapsed the decisive-step token
+    across every signature cluster (the gT5/gT6 root cause). Choosing it from a set
+    restores a diverse decisive axis.
+
+    DETERMINISM / REPRODUCIBILITY (the binding invariant): the choice is a pure
+    function of codeswarm's STABLE failure identity — the ``signature_token`` (kinds x
+    failing files) when present, else ``error_type``, else the task id. The same task
+    (same real failure) therefore ALWAYS localizes to the SAME node, so the seeded
+    pinned def (RED version = node index; GREEN pool version whose def carries this
+    node) reproduces the failure at the right node on the authoritative re-run. RED and
+    GREEN use this SAME function, so both polarities of a task land in the SAME
+    signature cluster (the per-signature training floor stays intact).
     """
-    return CORPUS_NODE_NAME
+    key = (
+        failure.get("signature_token")
+        or failure.get("error_type")
+        or task_id
+        or "unknown"
+    )
+    digest = hashlib.sha256(str(key).encode("utf-8")).digest()
+    return CORPUS_NODE_NAMES[digest[0] % len(CORPUS_NODE_NAMES)]
+
+
+# Back-compat wrapper: the historical name delegates to the new deterministic chooser
+# (signature unchanged). Prefer ``select_corpus_node`` in new code.
+def _sanitize_node_name(failure: dict, task_id: str) -> str:
+    return select_corpus_node(failure, task_id)
+
+
+def corpus_node_version(node_name: str) -> int:
+    """The RED pinned workflow_version that carries ``node_name`` (1-based node index).
+
+    RERUNNING pins (workflow_id, version) and fetches THAT def from workflow-manager, so
+    the failing node chosen for a task MUST live in the version we stamp on the original
+    execution. The proposed multi-node RED seed (docs/seed_multinode_proposal.sql) lays
+    out one pinned version per node in ``CORPUS_NODE_NAMES`` order, so version = index+1.
+    Unknown names fall back to version 1 (the legacy cs_oracle def) — a safe reproduce
+    node, never a crash.
+    """
+    try:
+        return CORPUS_NODE_NAMES.index(node_name) + 1
+    except ValueError:
+        return 1
 
 
 def build_corpus_failure_message(failure: dict, task_id: str) -> str:
@@ -524,7 +588,7 @@ def _default_green_workflow_id() -> str:
 
 
 class GreenKeyAllocator:
-    """File-backed round-robin allocator over the seeded GREEN pool versions 1..N.
+    """File-backed allocator over the seeded GREEN pool versions 1..N.
 
     Each seeded version v carries force_error_once_key "cs-green-<v>" whose global
     Redis counter mints EXACTLY ONE green row and is then exhausted (a later original
@@ -532,12 +596,23 @@ class GreenKeyAllocator:
     EE-pod key-clear helper resets it (or its 1h TTL lapses). This allocator hands
     each version out AT MOST ONCE per clear-cycle:
 
-      * ``allocate()``     -> version int, or None when the cycle is exhausted
-                              (caller must SKIP the green mint — never fall back to
-                              red for a recovered trajectory);
-      * ``release(v)``     -> return v to the pool (ONLY when the POST never reached
-                              EE, i.e. the counter was never touched);
-      * ``mark_cleared()`` -> start a fresh cycle AFTER the EE-pod helper ran.
+      * ``allocate()``          -> the smallest unused version, or None when the cycle
+                                   is exhausted (caller must SKIP the green mint — never
+                                   fall back to red for a recovered trajectory);
+      * ``allocate_for_node(n)`` -> the smallest unused version whose seeded def carries
+                                   node ``n`` (versions are interleaved across
+                                   ``CORPUS_NODE_NAMES`` so a task's green row lands on
+                                   the SAME node as its red row -> same signature
+                                   cluster), or None when that node's sub-pool is spent;
+      * ``release(v)``          -> return v to the pool (ONLY when the POST never
+                                   reached EE, i.e. the counter was never touched);
+      * ``mark_cleared()``      -> start a fresh cycle AFTER the EE-pod helper ran.
+
+    Version -> node is a fixed interleave: version v (1-based) carries
+    ``CORPUS_NODE_NAMES[(v-1) % len(CORPUS_NODE_NAMES)]`` — the SAME residue rule the
+    proposed multi-node green seed (docs/seed_multinode_proposal.sql) uses, so the
+    pinned def the re-run fetches for (workflow_id, v) always has the node this
+    allocator promised.
 
     State is a small JSON file (atomic tmp+rename write) so sequential CLI runs and
     the volume runner share one cycle. Single-writer by design (the volume runner is
@@ -548,21 +623,29 @@ class GreenKeyAllocator:
         self.state_path = str(state_path)
         env_size = os.environ.get("CODESWARM_GREEN_POOL_SIZE")
         self.pool_size = int(pool_size or env_size or DEFAULT_GREEN_POOL_SIZE)
-        self._state = self._load()
+        self._used = self._load()
+
+    @staticmethod
+    def version_node(version: int) -> str:
+        """The seeded node carried by pool ``version`` (fixed interleave)."""
+        return CORPUS_NODE_NAMES[(int(version) - 1) % len(CORPUS_NODE_NAMES)]
 
     # -- persistence ---------------------------------------------------------
-    def _load(self) -> dict:
+    def _load(self) -> set[int]:
         import json
 
         try:
             with open(self.state_path, encoding="utf-8") as fh:
                 st = json.load(fh)
-            return {
-                "next": int(st.get("next", 1)),
-                "freed": [int(v) for v in st.get("freed", [])],
-            }
         except Exception:  # noqa: BLE001 — missing/corrupt state starts a fresh cycle
-            return {"next": 1, "freed": []}
+            return set()
+        # Native format: an explicit ``used`` list. Legacy format: ``next``/``freed``
+        # (versions 1..next-1 handed out, minus any freed) — migrate it in place.
+        if "used" in st:
+            return {int(v) for v in st.get("used", [])}
+        nxt = int(st.get("next", 1))
+        freed = {int(v) for v in st.get("freed", [])}
+        return set(range(1, nxt)) - freed
 
     def _save(self) -> None:
         import json
@@ -572,8 +655,7 @@ class GreenKeyAllocator:
         try:
             _os.makedirs(_os.path.dirname(self.state_path) or ".", exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"next": self._state["next"], "freed": self._state["freed"],
-                           "pool_size": self.pool_size}, fh)
+                json.dump({"used": sorted(self._used), "pool_size": self.pool_size}, fh)
             _os.replace(tmp, self.state_path)
         except Exception as e:  # noqa: BLE001 — persistence is best-effort
             log.warning("green pool state save failed (%s): %s", self.state_path, e)
@@ -581,31 +663,42 @@ class GreenKeyAllocator:
     # -- API -----------------------------------------------------------------
     @property
     def remaining(self) -> int:
-        return max(0, self.pool_size - self._state["next"] + 1) + len(self._state["freed"])
+        return sum(1 for v in range(1, self.pool_size + 1) if v not in self._used)
+
+    def _take(self, version: int) -> int:
+        self._used.add(int(version))
+        self._save()
+        return int(version)
 
     def allocate(self) -> int | None:
-        if self._state["freed"]:
-            v = self._state["freed"].pop(0)
-        elif self._state["next"] <= self.pool_size:
-            v = self._state["next"]
-            self._state["next"] += 1
-        else:
-            return None
-        self._save()
-        return int(v)
+        """Hand out the smallest unused version, or None when the cycle is exhausted."""
+        for v in range(1, self.pool_size + 1):
+            if v not in self._used:
+                return self._take(v)
+        return None
+
+    def allocate_for_node(self, node_name: str) -> int | None:
+        """Hand out the smallest unused version whose seeded def carries ``node_name``.
+
+        Keeps a task's GREEN row on the SAME failing node as its RED row (so both land
+        in one signature cluster). Returns None when that node's sub-pool is spent — the
+        caller SKIPS the green mint (never falls back to red or to another node).
+        """
+        for v in range(1, self.pool_size + 1):
+            if v not in self._used and self.version_node(v) == node_name:
+                return self._take(v)
+        return None
 
     def release(self, version: int) -> None:
         """Return a version whose POST never reached EE (counter untouched)."""
-        v = int(version)
-        if v not in self._state["freed"]:
-            self._state["freed"].append(v)
-            self._save()
+        self._used.discard(int(version))
+        self._save()
 
     def mark_cleared(self) -> None:
         """Start a fresh cycle. Call ONLY after the EE-pod key-clear helper succeeded
         (clearing a key with an in-flight green recovery would flip its re-run back
         to a failure — the volume runner guards this by settling greens first)."""
-        self._state = {"next": 1, "freed": []}
+        self._used = set()
         self._save()
 
 
@@ -738,17 +831,23 @@ class OmiumCorpusRun:
 
     def _mint_red(self, task, run_id: str, failure: dict) -> str | None:
         workflow_id = self._resolve_workflow_id()
-        node_name = _sanitize_node_name(failure, task.id)
+        node_name = select_corpus_node(failure, task.id)
         message = build_corpus_failure_message(failure, task.id)
         wf_def = build_corpus_workflow_definition(node_name, message)
         body = build_corpus_execution_body(task, run_id, workflow_id, wf_def, failure)
+        # Pin the RED version that carries this node so the authoritative re-run fetches
+        # the pinned def with the SAME failing node (docs/seed_multinode_proposal.sql).
+        body["metadata"]["workflow_version"] = corpus_node_version(node_name)
+        body["metadata"]["codeswarm_failing_node"] = node_name
         eid = self._post_execution(body)
         if eid:
             self.execution_id = eid
             self.polarity = "red"
             log.info(
-                "omium corpus: minted RED (verified_failure) execution %s (task=%s sig_token=%s)",
-                eid, task.id, failure.get("signature_token"),
+                "omium corpus: minted RED (verified_failure) execution %s "
+                "(task=%s node=%s version=%s sig_token=%s)",
+                eid, task.id, node_name, body["metadata"]["workflow_version"],
+                failure.get("signature_token"),
             )
         return eid
 
@@ -759,26 +858,30 @@ class OmiumCorpusRun:
         mint is SKIPPED (honesty over volume) and the caller is told to clear keys.
         """
         allocator = self._green_allocator()
-        version = allocator.allocate()
+        # Choose the failing node FIRST, then draw a pool version from THAT node's
+        # sub-pool so the green row shares the red row's node (and signature cluster).
+        node_name = select_corpus_node(failure, task.id)
+        version = allocator.allocate_for_node(node_name)
         if version is None:
             log.warning(
-                "omium corpus: GREEN pool exhausted — run the EE-pod key-clear helper "
-                "(Omium-platform/scripts/stress/clear_codeswarm_green_keys.py) then reset "
-                "the cycle (GreenKeyAllocator.mark_cleared / corpus_runner --clear-keys-cmd). "
-                "SKIPPING green mint for %s (a recovered trajectory is never minted red).",
-                run_id,
+                "omium corpus: GREEN pool for node %s exhausted — run the EE-pod "
+                "key-clear helper (Omium-platform/scripts/stress/clear_codeswarm_green_keys.py) "
+                "then reset the cycle (GreenKeyAllocator.mark_cleared / corpus_runner "
+                "--clear-keys-cmd). SKIPPING green mint for %s (a recovered trajectory is "
+                "never minted red).",
+                node_name, run_id,
             )
             return None
         force_key = f"{GREEN_KEY_PREFIX}{version}"
         # SAME message builder as RED -> red+green land in the SAME signature cluster
         # (the training floor is per-signature: yield >= 200 AND desirable >= 50).
         message = build_corpus_failure_message(failure, task.id)
-        node_name = _sanitize_node_name(failure, task.id)
         wf_def = build_corpus_green_workflow_definition(node_name, message, force_key)
         body = build_corpus_green_execution_body(
             task, run_id, self._resolve_green_workflow_id(), wf_def, failure,
             version=version, force_key=force_key,
         )
+        body["metadata"]["codeswarm_failing_node"] = node_name
         eid = self._post_execution(body)
         if eid:
             self.execution_id = eid
@@ -786,8 +889,9 @@ class OmiumCorpusRun:
             self.green_version = version
             log.info(
                 "omium corpus: minted GREEN (verified_success) execution %s "
-                "(task=%s version=%s key=%s sig_token=%s)",
-                eid, task.id, version, force_key, failure.get("signature_token"),
+                "(task=%s node=%s version=%s key=%s sig_token=%s)",
+                eid, task.id, node_name, version, force_key,
+                failure.get("signature_token"),
             )
             return eid
         # The POST never reached EE -> the key's counter is untouched; reuse it.

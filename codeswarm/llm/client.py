@@ -6,6 +6,11 @@
   and NO API key. It is first-class: the whole system + its tests run offline.
 - ``AnthropicClient`` wraps the real Claude SDK. It LAZY-imports ``anthropic``
   inside ``__init__`` so importing this module never requires the package.
+- ``OpenAICompatibleClient`` speaks the OpenAI ``/chat/completions`` wire format
+  over stdlib ``urllib`` (no SDK dependency — core stays stdlib-only). Default
+  target: Nebius Token Factory. It maps codeswarm's Anthropic-shaped tool specs
+  to OpenAI ``tools`` and OpenAI ``tool_calls`` back to codeswarm's
+  ``{"name", "args"}`` shape, so agents are provider-agnostic.
 """
 from __future__ import annotations
 
@@ -116,6 +121,150 @@ class MockClient:
             )
 
         return LLMResponse(text="ok")
+
+
+def _to_openai_tools(tools: list[dict] | None) -> list[dict] | None:
+    """Anthropic tool spec {name, description, input_schema} -> OpenAI tools format."""
+    if not tools:
+        return None
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t.get("name", ""),
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
+            },
+        }
+        for t in tools
+    ]
+
+
+class OpenAICompatibleClient:
+    """Real client for any OpenAI-compatible ``/chat/completions`` endpoint.
+
+    Default target is Nebius Token Factory (``config.openai_base_url``); auth is a
+    Bearer key from ``config.openai_api_key`` (env: CODESWARM_OPENAI_API_KEY or
+    NEBIUS_API_KEY — codeswarm's secret convention is env vars, never files).
+
+    Implemented on stdlib ``urllib`` so codeswarm core stays dependency-free.
+    Non-streaming, single-shot completions — exactly what the agent loop uses
+    (agents feed tool outputs back as plain text; see CoderAgent). Tool specs are
+    mapped Anthropic->OpenAI on the way out and OpenAI ``tool_calls`` are mapped
+    back to codeswarm's ``{"name", "args"}`` dicts on the way in.
+    """
+
+    def __init__(self, config) -> None:  # config: codeswarm.config.Config
+        api_key = getattr(config, "openai_api_key", None)
+        if not api_key:
+            raise RuntimeError(
+                "OpenAICompatibleClient needs an API key: set CODESWARM_OPENAI_API_KEY "
+                "or NEBIUS_API_KEY in the environment."
+            )
+        base = (getattr(config, "openai_base_url", "") or "").rstrip("/")
+        if not base:
+            raise RuntimeError(
+                "OpenAICompatibleClient needs a base URL (CODESWARM_OPENAI_BASE_URL)."
+            )
+        self._api_key = api_key
+        self.endpoint = f"{base}/chat/completions"
+        self.model = config.model
+        self.max_tokens = int(
+            getattr(config, "openai_max_tokens", 8192) or 8192
+        )
+        self.timeout = 600.0  # generous: large reasoning models think for a while
+
+    # -- wire ------------------------------------------------------------------
+    def _post(self, payload: dict) -> dict:
+        """POST the payload; return the parsed JSON body. Split out for tests."""
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(
+            self.endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", "replace")[:2000]
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError(
+                f"OpenAI-compatible endpoint returned HTTP {exc.code}: {body}"
+            ) from exc
+
+    @staticmethod
+    def _parse(body: dict) -> LLMResponse:
+        """Parse a /chat/completions body into an LLMResponse.
+
+        Nebius Token Factory quirk (live-verified): a WRONG model id returns
+        HTTP 200 with EMPTY ``choices`` and no error field — treat zero choices
+        as a hard error instead of silently handing agents empty text.
+        """
+        choices = body.get("choices") or []
+        if not choices:
+            raise RuntimeError(
+                "OpenAI-compatible endpoint returned 200 with no choices — "
+                "on Nebius Token Factory this usually means a wrong model id "
+                f"(sent model exists? see GET /models). Body keys: {sorted(body)}"
+            )
+        message = choices[0].get("message") or {}
+        text = message.get("content") or ""
+        tool_calls: list[dict] = []
+        for call in message.get("tool_calls") or []:
+            fn = call.get("function") or {}
+            raw_args = fn.get("arguments") or "{}"
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                args = {}
+            tool_calls.append({"name": fn.get("name", ""), "args": args})
+        return LLMResponse(text=text, tool_calls=tool_calls)
+
+    # -- LLMClient interface -----------------------------------------------------
+    async def complete(
+        self,
+        system: str,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+    ) -> LLMResponse:
+        import asyncio
+
+        payload: dict = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": [{"role": "system", "content": system}, *messages],
+        }
+        oa_tools = _to_openai_tools(tools)
+        if oa_tools:
+            payload["tools"] = oa_tools
+
+        def _call() -> LLMResponse:
+            return self._parse(self._post(payload))
+
+        return await asyncio.to_thread(_call)
+
+
+def build_real_client(config) -> "LLMClient":
+    """Pick the real (non-mock) client from ``config.llm_provider``.
+
+    "anthropic" (default) and "vertex" both live in AnthropicClient;
+    "openai_compatible" is the OpenAI-wire client (Nebius Token Factory).
+    """
+    provider = getattr(config, "llm_provider", "anthropic")
+    if provider == "openai_compatible":
+        return OpenAICompatibleClient(config)
+    return AnthropicClient(config)
 
 
 class AnthropicClient:
