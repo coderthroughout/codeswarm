@@ -438,23 +438,41 @@ def build_corpus_failure_message(failure: dict, task_id: str) -> str:
 
 
 def build_corpus_workflow_definition(node_name: str, message: str) -> dict:
-    """Inline langgraph def whose middle node PERMANENTLY force_errors ``message``.
+    """Inline langgraph def whose FAILING node PERMANENTLY force_errors ``message``.
 
     Mirrors the proven scripts/stress/recovery_load.py RED shape (ingest -> fail ->
     summarize). ``force_error`` makes EE's node raise RuntimeError(message) so the real
     terminal-failure path (and _publish_execution_failed) fires.
+
+    gT6 MULTI-NODE (2026-07-15): the def carries a SECOND, passive ``process_node``
+    (``<node>_probe``) downstream of the failing node. This makes the def have >=2
+    ``process_node`` nodes, so the orchestrator's terminal rerun-evidence upgrade
+    (recovery-orchestrator ``_rerun_evidence.py::_single_substantive_node``, which fires
+    only for a SINGLE process_node) does NOT auto-stamp ``replay_derived``. With the
+    attribution tracer off the row then honestly keeps ``llm_guessed`` — populating the
+    gT6 comparison arm. Signature stability is preserved: only ``node_name`` force_errors,
+    so it is the sole node that raises and stays the failing_node (WHERE axis of the EE
+    signature). The probe node is passive (no force_error, no side effect) and only
+    executes on the harness FLIP probe (which excludes the decisive node), where it must
+    pass cleanly so the flip yields ``not_reproduce``.
+    NOTE: the PINNED seed def (Omium-platform scripts/seed_codeswarm_corpus_*.sql) MUST
+    carry the same 2-process_node shape — the upgrade guard reads the PINNED def on re-run,
+    not this inline def. Keep them in lock-step.
     """
+    probe_name = f"{node_name}_probe"
     return {
         "name": f"codeswarm-corpus-{node_name}",
         "nodes": [
             {"name": "ingest", "function": "ingest_node"},
             {"name": node_name, "function": "process_node", "force_error": message},
+            {"name": probe_name, "function": "process_node"},
             {"name": "summarize", "function": "summarize_node"},
         ],
         "edges": [
             {"from": "START", "to": "ingest"},
             {"from": "ingest", "to": node_name},
-            {"from": node_name, "to": "summarize"},
+            {"from": node_name, "to": probe_name},
+            {"from": probe_name, "to": "summarize"},
             {"from": "summarize", "to": "END"},
         ],
     }
@@ -522,6 +540,7 @@ def build_corpus_green_workflow_definition(
     green rows land in the SAME signature cluster (the floor is per-signature:
     yield >= 200 AND desirable >= 50).
     """
+    probe_name = f"{node_name}_probe"
     return {
         "name": GREEN_WORKFLOW_NAME,
         "nodes": [
@@ -533,12 +552,18 @@ def build_corpus_green_workflow_definition(
                 "force_error_once_key": force_key,
                 "emit_side_effect": "orders",
             },
+            # gT6 MULTI-NODE: passive 2nd process_node so the pinned def has >=2
+            # process_nodes (suppresses the replay_derived auto-upgrade -> row stays
+            # llm_guessed). No force_error, NO emit_side_effect (keeps the GREEN
+            # `orders exactly_one` postcondition intact — only node_name emits orders).
+            {"name": probe_name, "function": "process_node"},
             {"name": "summarize", "function": "summarize_node"},
         ],
         "edges": [
             {"from": "START", "to": "ingest"},
             {"from": "ingest", "to": node_name},
-            {"from": node_name, "to": "summarize"},
+            {"from": node_name, "to": probe_name},
+            {"from": probe_name, "to": "summarize"},
             {"from": "summarize", "to": "END"},
         ],
         "postconditions": _orders_postconditions(node_name),

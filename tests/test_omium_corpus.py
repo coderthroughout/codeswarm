@@ -118,13 +118,26 @@ def test_message_embeds_real_signature_token_and_is_honest():
 def test_workflow_definition_has_force_error_node():
     wf = oe.build_corpus_workflow_definition(oe.CORPUS_NODE_NAME, "boom-msg")
     names = [n["name"] for n in wf["nodes"]]
-    assert names == ["ingest", oe.CORPUS_NODE_NAME, "summarize"]
-    fail_node = wf["nodes"][1]
+    probe = f"{oe.CORPUS_NODE_NAME}_probe"
+    # gT6 MULTI-NODE: ingest -> fail -> <node>_probe -> summarize (2 process_nodes).
+    assert names == ["ingest", oe.CORPUS_NODE_NAME, probe, "summarize"]
+    # Exactly one force_error node (the decisive/failing node), selected by role not index.
+    fail_nodes = [n for n in wf["nodes"] if "force_error" in n]
+    assert len(fail_nodes) == 1
+    fail_node = fail_nodes[0]
+    assert fail_node["name"] == oe.CORPUS_NODE_NAME
     assert fail_node["force_error"] == "boom-msg"
-    # START -> ingest -> fail -> summarize -> END wiring.
+    # Exactly TWO process_node nodes (the gT6 invariant that suppresses replay_derived
+    # auto-upgrade); the probe node is passive (no force_error).
+    process_nodes = [n for n in wf["nodes"] if n.get("function") == "process_node"]
+    assert len(process_nodes) == 2
+    assert any(n["name"] == probe and "force_error" not in n for n in process_nodes)
+    # START -> ingest -> fail -> probe -> summarize -> END wiring.
     froms = {(e["from"], e["to"]) for e in wf["edges"]}
     assert ("START", "ingest") in froms
     assert ("ingest", oe.CORPUS_NODE_NAME) in froms
+    assert (oe.CORPUS_NODE_NAME, probe) in froms
+    assert (probe, "summarize") in froms
     assert ("summarize", "END") in froms
 
 
@@ -251,9 +264,12 @@ def test_mint_posts_failing_execution_and_returns_id():
         body = recorder["json"]
         # Drives a real langgraph run with an inline force_error definition.
         assert body["metadata"]["workflow_type"] == "langgraph"
-        fail_node = body["metadata"]["workflow_definition"]["nodes"][1]
+        nodes = body["metadata"]["workflow_definition"]["nodes"]
+        fail_node = next(n for n in nodes if "force_error" in n)
         # The force_error message carries codeswarm's REAL signature token (honest).
         assert "AssertionError+TypeError::test_math_utils.py" in fail_node["force_error"]
+        # gT6: exactly two process_nodes (one failing, one passive probe).
+        assert len([n for n in nodes if n.get("function") == "process_node"]) == 2
         assert body["workflow_id"] == "wf-uuid-1"
     finally:
         sys.modules.pop("httpx", None)

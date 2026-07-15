@@ -134,9 +134,14 @@ def test_runner_end_to_end_offline(tmp_path, monkeypatch):
         assert rc == 0
         posts = recorder["posts"]
         assert len(posts) == 2
-        nodes = [p["json"]["metadata"]["workflow_definition"]["nodes"][1] for p in posts]
-        red_nodes = [n for n in nodes if "force_error" in n]
-        green_nodes = [n for n in nodes if "force_error_once" in n]
+        all_nodes = [p["json"]["metadata"]["workflow_definition"]["nodes"] for p in posts]
+        # gT6: each posted def must have exactly two process_nodes (one failing, one probe).
+        for nl in all_nodes:
+            assert len([n for n in nl if n.get("function") == "process_node"]) == 2
+        # Select the failing node by role, not position. A green node has force_error_once
+        # (NOT force_error), so red_nodes correctly excludes greens.
+        red_nodes = [n for nl in all_nodes for n in nl if "force_error" in n]
+        green_nodes = [n for nl in all_nodes for n in nl if "force_error_once" in n]
         assert len(red_nodes) == 1
         assert len(green_nodes) == 1
         # One signature cluster: identical real failure message on both arms.

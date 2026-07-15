@@ -129,14 +129,23 @@ def test_green_workflow_id_matches_seed():
 def test_green_definition_shape():
     wf = oe.build_corpus_green_workflow_definition(oe.CORPUS_NODE_NAME, "boom-msg", "cs-green-7")
     names = [n["name"] for n in wf["nodes"]]
-    assert names == ["ingest", "cs_oracle", "summarize"]
-    node = wf["nodes"][1]
-    # Fail-ONCE (not permanent), keyed to the seeded per-version counter.
+    probe = f"{oe.CORPUS_NODE_NAME}_probe"
+    # gT6 MULTI-NODE: ingest -> heal-once node -> <node>_probe -> summarize.
+    assert names == ["ingest", "cs_oracle", probe, "summarize"]
+    # Fail-ONCE node selected by role, not position.
+    node = next(n for n in wf["nodes"] if "force_error_once" in n)
+    assert node["name"] == "cs_oracle"
     assert node["force_error_once"] == "boom-msg"
     assert "force_error" not in node
     assert node["force_error_once_key"] == "cs-green-7"
     # The heal writes the real ground-truth row the Tier-1 probe reads.
     assert node["emit_side_effect"] == "orders"
+    # Exactly two process_nodes; the probe is passive (no directives, no side effect
+    # -> keeps the `orders exactly_one` postcondition holding).
+    process_nodes = [n for n in wf["nodes"] if n.get("function") == "process_node"]
+    assert len(process_nodes) == 2
+    probe_node = next(n for n in process_nodes if n["name"] == probe)
+    assert "force_error_once" not in probe_node and "emit_side_effect" not in probe_node
     pc = wf["postconditions"][0]
     assert pc["step_id"] == "cs_oracle"
     assert pc["assertion"]["store"] == "orders"
@@ -274,7 +283,7 @@ def test_mint_routes_recovered_trajectory_to_green(tmp_path):
         assert oe.GreenKeyAllocator.version_node(version) == expected_node
         body = recorder["posts"][0]["json"]
         assert body["workflow_id"] == "green-wf-id"
-        node = body["metadata"]["workflow_definition"]["nodes"][1]
+        node = next(n for n in body["metadata"]["workflow_definition"]["nodes"] if "force_error_once" in n)
         assert node["name"] == expected_node
         assert node["force_error_once_key"] == f"cs-green-{version}"
         assert "force_error" not in node
@@ -297,7 +306,7 @@ def test_mint_routes_unrecovered_trajectory_to_red(tmp_path):
         assert run.polarity == "red"
         body = recorder["posts"][0]["json"]
         assert body["workflow_id"] == "red-wf-id"
-        node = body["metadata"]["workflow_definition"]["nodes"][1]
+        node = next(n for n in body["metadata"]["workflow_definition"]["nodes"] if "force_error" in n)
         assert "force_error" in node
         assert "force_error_once" not in node
         assert body["metadata"]["corpus_polarity"] == "red"
